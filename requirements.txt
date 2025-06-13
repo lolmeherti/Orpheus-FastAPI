@@ -13,6 +13,7 @@ watchfiles==1.0.4
 # Audio Processing
 numpy==1.24.0
 sounddevice==0.4.6
+soundfile==0.12.1
 snac==1.2.1       # Required for audio generation from tokens
 
 # System Utilities

@@ -13,37 +13,39 @@ RUN apt-get update && apt-get install -y \
     portaudio19-dev \
  && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Create non-root user and set up directories
-RUN useradd -m -u 1001 appuser && \
+# Ensure www-data group exists and use it for appuser
+# UID: 1001 (non-root), GID: www-data (standard web group)
+RUN useradd -m -u 1001 -g www-data -g audio appuser && \
     mkdir -p /app/outputs /app && \
-    chown -R appuser:appuser /app
+    chown -R appuser:www-data /app && \
+    chmod -R 775 /app
 
+# Switch to appuser
 USER appuser
 WORKDIR /app
 
-# Copy dependency files
-COPY --chown=appuser:appuser requirements.txt ./requirements.txt
-
-# Create and activate virtual environment
+# Set up virtualenv
+COPY --chown=appuser:www-data requirements.txt ./requirements.txt
 RUN python3 -m venv /app/venv
 ENV PATH="/app/venv/bin:$PATH"
 
-# Install PyTorch with CUDA support and other dependencies
-RUN pip3 install --no-cache-dir --pre \
+# Install PyTorch with CUDA and project deps
+RUN pip install --no-cache-dir --pre \
     torch torchvision torchaudio \
-    --index-url https://download.pytorch.org/whl/nightly/cu128 \
- && pip3 install --no-cache-dir -r requirements.txt
+    --index-url https://download.pytorch.org/whl/nightly/cu128 && \
+    pip install --no-cache-dir -r requirements.txt
 
-# Copy project files
-COPY --chown=appuser:appuser . .
+# Copy project files with correct ownership
+COPY --chown=appuser:www-data . .
 
-# Set environment variables
+# Reconfirm folder permissions after COPY
+RUN chmod -R g+w /app
+
+# Final environment setup
 ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app \
     USE_GPU=true
 
-# Expose the port
 EXPOSE 5005
 
-# Run FastAPI server with uvicorn
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "5005", "--workers", "1"]
