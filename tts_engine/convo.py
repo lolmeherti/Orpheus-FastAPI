@@ -14,8 +14,8 @@ os.environ["NEMO_DISABLE_TQDM"] = "1"
 
 VAD_INTERRUPT_TIMEOUT_S           = 0.5
 VAD_DEFAULT_SILENCE_TIMEOUT_S     = 1.2
-VAD_LONG_PROMPT_TIMEOUT_S         = 2.0
-VAD_LONG_PROMPT_TRIGGER_S         = 3.0
+VAD_LONG_PROMPT_TIMEOUT_S         = 2
+VAD_LONG_PROMPT_TRIGGER_S         = 3
 INTERRUPTION_DURATION_THRESHOLD_S = 4
 
 MIN_WORDS_ASR                     = 1
@@ -101,8 +101,17 @@ def asr_listener():
         vad_model, utils = torch.hub.load(repo_or_dir='snakers4/silero-vad', model='silero_vad', force_reload=False)
         (get_speech_timestamps, _, _, _, _) = utils; print("🎤 Silero VAD model loaded.")
     except Exception as e: print(f"‼️ FATAL: Could not load ASR/VAD models: {e}"); traceback.print_exc(); program_is_shutting_down.set(); return
-    sr = 16000; vad_chunk_size = 512; vad_chunk_duration_s = vad_chunk_size / sr; min_speech_frames = int(VAD_MIN_SPEECH_S / vad_chunk_duration_s)
-    is_speaking = False; audio_buffer_list = []; silence_counter_frames = 0
+
+    sr = 16000
+    vad_chunk_size = 512
+    vad_chunk_duration_s = vad_chunk_size / sr
+    min_speech_frames = int(VAD_MIN_SPEECH_S / vad_chunk_duration_s)
+
+    is_speaking = False
+    audio_buffer_list = []
+    silence_counter_frames = 0
+    is_long_prompt_criteria_met = False # NEW: Flag to optimize long prompt detection
+
     try:
         with sd.InputStream(samplerate=sr, channels=1, dtype='float32', blocksize=vad_chunk_size, callback=None) as stream:
             print("🎤 Continuous ASR listening (Literal Transcription Mode)…")
@@ -110,53 +119,103 @@ def asr_listener():
                 try:
                     frame_float32, overflowed = stream.read(vad_chunk_size)
                     if overflowed: print("‼️ Mic overflow!", file=sys.stderr); continue
-                    audio_tensor = torch.from_numpy(frame_float32.flatten()); speech_confidence = vad_model(audio_tensor, sr).item()
+
+                    audio_tensor = torch.from_numpy(frame_float32.flatten())
+                    speech_confidence = vad_model(audio_tensor, sr).item()
                     is_speech_in_current_frame = speech_confidence > VAD_SPEECH_CONFIDENCE_THRESHOLD
+
                     if is_speaking:
                         audio_buffer_list.append(frame_float32)
-                        if is_speech_in_current_frame: silence_counter_frames = 0
-                        else:
-                            silence_counter_frames += 1; active_timeout_s = VAD_DEFAULT_SILENCE_TIMEOUT_S
-                            if tts_actively_playing.is_set(): active_timeout_s = VAD_INTERRUPT_TIMEOUT_S
+                        if is_speech_in_current_frame:
+                            silence_counter_frames = 0 # Reset silence on speech
+                        else: # Current frame is silent
+                            silence_counter_frames += 1
+                            active_timeout_s = VAD_DEFAULT_SILENCE_TIMEOUT_S # Default assumption
+
+                            if tts_actively_playing.is_set():
+                                active_timeout_s = VAD_INTERRUPT_TIMEOUT_S
                             else:
-                                if audio_buffer_list:
+                                # Optimized check for long prompt:
+                                # Only run the expensive speech duration calculation if we haven't already
+                                # determined this utterance is long.
+                                if not is_long_prompt_criteria_met:
+                                    # This concatenation and get_speech_timestamps can be slow on long buffers
                                     current_audio_data_np = np.concatenate(audio_buffer_list).squeeze()
                                     if current_audio_data_np.ndim == 0: current_audio_data_np = np.array([current_audio_data_np])
                                     current_audio_data = torch.from_numpy(current_audio_data_np)
+
+                                    # Get actual speech segments from the current buffer
                                     speech_ts = get_speech_timestamps(current_audio_data, vad_model, sampling_rate=sr, min_speech_duration_ms=int(VAD_MIN_SPEECH_S * 1000))
+
                                     if speech_ts:
-                                        precise_speech_duration_s = (speech_ts[-1]['end'] - speech_ts[0]['start']) / sr
-                                        if precise_speech_duration_s > VAD_LONG_PROMPT_TRIGGER_S: active_timeout_s = VAD_LONG_PROMPT_TIMEOUT_S
+                                        # Calculate duration of actual detected speech in the buffer
+                                        precise_speech_duration_in_buffer_s = (speech_ts[-1]['end'] - speech_ts[0]['start']) / sr
+                                        if precise_speech_duration_in_buffer_s > VAD_LONG_PROMPT_TRIGGER_S:
+                                            is_long_prompt_criteria_met = True
+
+                                # Set timeout based on whether the long prompt criteria has been met
+                                if is_long_prompt_criteria_met:
+                                    # User requested VAD_LONG_PROMPT_TRIGGER_S for long prompts
+                                    active_timeout_s = VAD_LONG_PROMPT_TRIGGER_S
+                                    # If you find 3.0s too long after this fix, you might revert to:
+                                    # active_timeout_s = VAD_LONG_PROMPT_TIMEOUT_S # (2.0s)
+                                    # Or even:
+                                    # active_timeout_s = VAD_DEFAULT_SILENCE_TIMEOUT_S # (1.2s)
+                                else:
+                                    active_timeout_s = VAD_DEFAULT_SILENCE_TIMEOUT_S
+
                             silence_duration_s_calculated = silence_counter_frames * vad_chunk_duration_s
                             if silence_duration_s_calculated >= active_timeout_s:
-                                is_speaking = False; end_of_speech_time = time.monotonic()
+                                is_speaking = False
+                                is_long_prompt_criteria_met = False # Reset flag for the next utterance
+                                end_of_speech_time = time.monotonic()
+
                                 if len(audio_buffer_list) >= min_speech_frames:
                                     full_audio_np = np.concatenate(audio_buffer_list).squeeze()
                                     if full_audio_np.ndim == 0: full_audio_np = np.array([full_audio_np])
+
+                                    # Final VAD pass on the full audio to get precise duration for logging
                                     final_speech_ts = get_speech_timestamps(torch.from_numpy(full_audio_np), vad_model, sampling_rate=sr, min_speech_duration_ms=int(VAD_MIN_SPEECH_S * 1000))
                                     speech_duration_s_for_userq = (final_speech_ts[-1]['end'] - final_speech_ts[0]['start']) / sr if final_speech_ts else 0.0
+
+                                    # CORRECTED LINE:
                                     result = asr_model.transcribe(full_audio_np, fp16=torch.cuda.is_available(), beam_size=WHISPER_BEAM_SIZE, logprob_threshold=WHISPER_LOGPROB_THRESHOLD, no_speech_threshold=WHISPER_NO_SPEECH_THRESHOLD, condition_on_previous_text=False)
-                                    txt = result['text'].strip(); processing_lag_s = time.monotonic() - end_of_speech_time
+                                    txt = result['text'].strip()
+                                    processing_lag_s = time.monotonic() - end_of_speech_time
+
                                     if txt:
                                         is_echo = False
                                         if tts_actively_playing.is_set() and last_tts_text:
                                             similarity = SequenceMatcher(None, txt.lower(), last_tts_text.lower()).ratio()
                                             if similarity > ECHO_SIMILARITY_THRESHOLD: print(f"🎤 Echo detected (Similarity: {similarity:.2f}), discarding.", file=sys.stderr); is_echo = True
+
                                         if not is_echo and len(txt.split()) >= MIN_WORDS_ASR:
                                             print(f"\n🗣️ User (ASR): '{txt}' (Duration: {speech_duration_s_for_userq:.2f}s, VAD Lag: {processing_lag_s:.2f}s)")
-                                            if tts_actively_playing.is_set() and not interruption_requested.is_set(): print("🎤 ASR: User spoke while TTS active -> Setting INTERRUPT_REQUESTED"); interruption_requested.set()
+                                            if tts_actively_playing.is_set() and not interruption_requested.is_set():
+                                                print("🎤 ASR: User spoke while TTS active -> Setting INTERRUPT_REQUESTED")
+                                                interruption_requested.set()
                                             user_q.put((txt, speech_duration_s_for_userq))
-                                audio_buffer_list = []; silence_counter_frames = 0
-                    elif is_speech_in_current_frame:
-                        is_speaking = True; silence_counter_frames = 0; audio_buffer_list = [frame_float32]
-                        if not tts_actively_playing.is_set(): print("\n🎤 Speech detected…", end='', flush=True)
+
+                                audio_buffer_list = [] # Clear buffer after processing
+                                silence_counter_frames = 0 # Reset for safety, though is_speaking is now false
+
+                    elif is_speech_in_current_frame: # Was not speaking, but speech detected now
+                        is_speaking = True
+                        silence_counter_frames = 0
+                        audio_buffer_list = [frame_float32] # Start new buffer
+                        is_long_prompt_criteria_met = False # Reset for new utterance
+                        if not tts_actively_playing.is_set():
+                            print("\n🎤 Speech detected…", end='', flush=True)
+
                 except sd.PortAudioError as pae:
                     if "Input overflowed" in str(pae): print("‼️ Mic overflow (PortAudioError)!", file=sys.stderr); continue
                     print(f"‼️ ASR PortAudioError: {pae}", file=sys.stderr); sd.sleep(1) # type: ignore
                 except Exception as e:
                     if program_is_shutting_down.is_set(): break
-                    print(f"‼️ ASR loop error: {e}", file=sys.stderr); traceback.print_exc(); is_speaking = False; audio_buffer_list = []; silence_counter_frames = 0; sd.sleep(1) # type: ignore
-    except Exception as e: print(f"‼️ ASR: Could not open InputStream: {e}"); traceback.print_exc()
+                    print(f"‼️ ASR loop error: {e}", file=sys.stderr); traceback.print_exc()
+                    is_speaking = False; audio_buffer_list = []; silence_counter_frames = 0; is_long_prompt_criteria_met = False; sd.sleep(1) # type: ignore
+    except Exception as e:
+        print(f"‼️ ASR: Could not open InputStream: {e}"); traceback.print_exc()
     print("🎤 ASR listener thread finished.")
 
 def kb_listener():
