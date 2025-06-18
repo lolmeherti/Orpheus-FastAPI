@@ -18,3 +18,4 @@ snac==1.2.1
 
 # Misc
 psutil==5.9.0
+pydub>=0.25
