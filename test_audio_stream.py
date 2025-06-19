@@ -3,133 +3,103 @@ import math, shutil, numpy as np, pyaudio
 from pathlib import Path
 from pydub import AudioSegment
 from pydub.effects import strip_silence
-
 from eq_loudnorm_fast import conform_clip_memory
 from prosody_fast import match_pitch, get_f0
 
-# ---------- paths / constants ----------
-CLIP_DIR          = Path("cached_clips")
-CROSSFADE_MS      = 150
-CHUNK_MS          = 20
-SILENCE_THRES_DB  = -50
-FADE_IN_MS        = 100
-TARGET_LUFS       = -27.2
-FADE_OUT_MS       = 250
+# ---------- config ----------
+CLIP_DIR         = Path("cached_clips")
+CROSSFADE_MS     = 150          # overlap duration
+CHUNK_MS         = 20           # PyAudio buffer
+SILENCE_THRES_DB = -50
+FADE_IN_MS       = 100
+TARGET_LUFS      = -27.2
+SAFE_PAUSE_MS   = 250     # keep up to 0.25 s of intentional pause
+EDGE_FADE_MS    = 5       # tiny click-killer fade
 
-# ---------- reference F0 (one cached clip) ----------
-ref_clip  = AudioSegment.from_file(CLIP_DIR / "alright_i_hear_you_pending_cache.wav", "wav")
-REF_F0    = get_f0(ref_clip)
+# ---------- reference pitch ----------
+ref_clip = AudioSegment.from_file(CLIP_DIR / "alright_i_hear_you_pending_cache.wav", "wav")
+REF_F0   = get_f0(ref_clip)
 print(f"🎯 reference F0 = {REF_F0:.2f} Hz")
 
-# ---------- helper funcs ----------
+# ---------- preprocess ----------
 def preprocess(seg: AudioSegment) -> AudioSegment:
-    seg = strip_silence(seg, silence_thresh=SILENCE_THRES_DB, padding=0)
-    seg = seg.fade_in(FADE_IN_MS).fade_out(60)
-    seg = match_pitch(REF_F0, seg)
-    seg = conform_clip_memory(seg, TARGET_LUFS)
-    return seg
+    """
+    • keep first SAFE_PAUSE_MS of silence
+    • drop excess low-level noise beyond that
+    • micro-fade edges, then loudness & pitch fix
+    """
+    # 1) detect leading silence
+    trim_seg = strip_silence(seg,
+                             silence_thresh=SILENCE_THRES_DB,
+                             padding=0)
+    lead_sil_ms = len(seg) - len(trim_seg)
 
-def stream_crossfade_sequence(clips: list[AudioSegment]):
-    sr = clips[0].frame_rate
-    chunk_samples = int(sr * CHUNK_MS / 1000)
-    fade_samples = int(sr * CROSSFADE_MS / 1000)
+    # 2) decide how much to keep
+    keep_ms = min(lead_sil_ms, SAFE_PAUSE_MS)
+    seg_kept = seg[:keep_ms] + trim_seg    # concatenate kept pause + voiced
 
-    pa = pyaudio.PyAudio()
-    out = pa.open(format=pyaudio.paInt16,
-                  channels=1,
-                  rate=sr,
-                  output=True,
-                  frames_per_buffer=chunk_samples)
+    # 3) tiny edge fades
+    seg_kept = seg_kept.fade_in(EDGE_FADE_MS).fade_out(EDGE_FADE_MS)
 
-    def seg_to_np(seg: AudioSegment) -> np.ndarray:
-        return np.array(seg.get_array_of_samples()).astype(np.int16)
+    # 4) artistic fade-in (for breathy starts)
+    seg_kept = seg_kept.fade_in(FADE_IN_MS)
 
-    def to_bytes(arr: np.ndarray) -> bytes:
-        return arr.astype(np.int16).tobytes()
+    # 5) pitch & loudness
+    seg_kept = match_pitch(REF_F0, seg_kept)
+    seg_kept = conform_clip_memory(seg_kept, TARGET_LUFS)
+    return seg_kept
 
-    first_np = seg_to_np(clips[0])
-    pos = 0
-    lead_len = len(first_np) - fade_samples
-    while pos < lead_len:
-        out.write(to_bytes(first_np[pos:pos + chunk_samples]))
-        pos += chunk_samples
-
-    prev_np = first_np
-    for idx in range(1, len(clips)):
-        next_np = seg_to_np(clips[idx])
-
-        # Crossfade tail of prev into head of next
-        prev_tail = prev_np[-fade_samples:]
-        next_head = next_np[:fade_samples]
-        fade = np.linspace(0, 1, fade_samples, dtype=np.float32)
-        mixed = ((1 - fade) * prev_tail + fade * next_head).astype(np.int16)
-        out.write(to_bytes(mixed))
-
-        # Stream the rest of the next clip (excluding what was used in fade)
-        pos = fade_samples
-        while pos < len(next_np):
-            out.write(to_bytes(next_np[pos:pos + chunk_samples]))
-            pos += chunk_samples
-
-        prev_np = next_np
-
-    out.stop_stream()
-    out.close()
-    pa.terminate()
-
-def stream_crossfade_tail(a: AudioSegment, b: AudioSegment):
-    sr              = a.frame_rate
-    chunk_samples   = int(sr * CHUNK_MS / 1000)
-    fade_samples    = int(sr * CROSSFADE_MS / 1000)
+# ---------- player ----------
+def stream_crossfade_sequence(segments: list[AudioSegment]):
+    sr = segments[0].frame_rate
+    chunk = int(sr * CHUNK_MS / 1000)
+    fade  = int(sr * CROSSFADE_MS / 1000)
 
     pa  = pyaudio.PyAudio()
-    out = pa.open(format=pyaudio.paInt16,
-                  channels=1, rate=sr, output=True,
-                  frames_per_buffer=chunk_samples)
+    out = pa.open(format=pyaudio.paInt16, channels=1, rate=sr,
+                  output=True, frames_per_buffer=chunk)
 
-    a_np, b_np = (np.array(seg.get_array_of_samples(), np.int16) for seg in (a, b))
-    lead_len   = len(a_np) - fade_samples
+    def seg_np(seg): return np.array(seg.get_array_of_samples(), np.int16)
 
-    # play main body of A
-    for pos in range(0, lead_len, chunk_samples):
-        out.write(a_np[pos:pos + chunk_samples].tobytes())
+    prev = seg_np(segments[0])
+    pos  = 0
+    # play body of first clip (leave 'fade' samples for overlap)
+    lead_len = len(prev) - fade
+    while pos < lead_len:
+        out.write(prev[pos:pos + chunk].tobytes())
+        pos += chunk
 
-    # cross-fade
-    fade = np.linspace(0, 1, fade_samples, dtype=np.float32)
-    mixed = ((1 - fade) * a_np[lead_len:] + fade * b_np[:fade_samples]).astype(np.int16)
-    out.write(mixed.tobytes())
+    for nxt_seg in segments[1:]:
+        nxt = seg_np(nxt_seg)
 
-    # play remainder of B
-    tail_b = b_np[fade_samples:]
-    for pos in range(0, len(tail_b), chunk_samples):
-        out.write(tail_b[pos:pos + chunk_samples].tobytes())
+        # ---- cross-fade prev tail ↔ next head ----
+        blend = ((1 - np.linspace(0, 1, fade)) * prev[-fade:] +
+                 np.linspace(0, 1, fade) * nxt[:fade]).astype(np.int16)
+        out.write(blend.tobytes())
+
+        # ---- stream rest of next clip ----
+        pos = fade
+        while pos < len(nxt):
+            out.write(nxt[pos:pos + chunk].tobytes())
+            pos += chunk
+        prev = nxt                                # advance window
 
     out.stop_stream(); out.close(); pa.terminate()
 
 # ---------- main ----------
 def main():
+    # Put clips in the **exact** order you want to hear them
     clip_paths = [
         CLIP_DIR / "fair_enough_pending_cache.wav",
         CLIP_DIR / "fine_im_listening_pending_cache.wav",
-        CLIP_DIR / "okay_hang_on_i_might_have_an_idea_long_query_cache.wav"
+        CLIP_DIR / "okay_hang_on_i_might_have_an_idea_long_query_cache.wav",
     ]
-
     if len(clip_paths) < 2:
-        print("Need ≥ 2 clips.")
-        return
+        print("Need at least two clips."); return
 
-    segments = [preprocess(AudioSegment.from_file(path, "wav")) for path in clip_paths]
-
+    segments = [preprocess(AudioSegment.from_file(p, "wav")) for p in clip_paths]
+    print(f"▶️ Streaming {len(segments)} clips with {CROSSFADE_MS} ms overlaps…")
     stream_crossfade_sequence(segments)
-
-#
-#     # 🔁 Load and preprocess all clips
-#     segments = [preprocess(AudioSegment.from_file(path, "wav")) for path in clip_paths]
-#
-#     # 🔀 Crossfade all clips sequentially
-#     for i in range(len(segments) - 1):
-#         print(f"▶️ {clip_paths[i].name} → cross-fading into {clip_paths[i+1].name}")
-#         stream_crossfade_tail(segments[i], segments[i + 1])
 
 if __name__ == "__main__":
     main()
