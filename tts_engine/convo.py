@@ -12,6 +12,7 @@ import numpy as np
 import requests
 import torch
 import httpx
+import http.client
 from faster_whisper import WhisperModel
 
 # Audio libraries
@@ -33,14 +34,14 @@ VAD_INTERRUPT_TIMEOUT_S = 0.2
 VAD_DEFAULT_SILENCE_TIMEOUT_S = 1.2
 VAD_LONG_PROMPT_TIMEOUT_S = 2.0
 VAD_LONG_PROMPT_TRIGGER_S = 3.0
-INTERRUPTION_DURATION_THRESHOLD_S = 4 # How short an utterance during TTS must be to be considered an interruption
+INTERRUPTION_DURATION_THRESHOLD_S = 4
 MIN_WORDS_ASR = 1
 VAD_MIN_SPEECH_S = 0.25
 VAD_SPEECH_CONFIDENCE_THRESHOLD = 0.3
 ECHO_SIMILARITY_THRESHOLD = 0.7
 
 # --- Core Application Settings ---
-LM_STUDIO_CHAT_URL = "http://localhost:1234/v1/chat/completions"
+LM_STUDIO_CHAT_URL = "http://127.0.0.1:1234/v1/chat/completions"
 ORPHEUS_API_URL = "http://127.0.0.1:5005/v1/audio/speech"
 VOICE = "tara"
 MIN_WORDS_FOR_CHUNK = 8 # Critical for how quickly first audio is generated
@@ -92,6 +93,8 @@ logging.basicConfig(
     format='%(asctime)s.%(msecs)03d %(levelname)-7s [%(threadName)-15s] %(message)s',
     datefmt='%H:%M:%S'
 )
+
+logging.getLogger("http.client").setLevel(logging.WARNING)
 
 # --- Helper Functions ---
 def strip_action_and_emoji(text: str) -> str:
@@ -587,24 +590,33 @@ def cleanup_old_audio():
 
 def hermes_chat(msgs): # Modified for httpx Client
     try:
-        request_time = time.monotonic()
+        request_time_outer = time.monotonic() # Time before client instantiation and call
         buffer = ""
         first_token_received = False
         timeout_config = httpx.Timeout(10.0, read=60.0)
 
-        # Create a client, explicitly manage trust_env for proxies
-        # trust_env=False will ignore HTTP_PROXY/HTTPS_PROXY environment variables
         with httpx.Client(timeout=timeout_config, trust_env=False) as client:
+            request_time_inner = time.monotonic() # Time just before client.stream()
             with client.stream("POST",
                                LM_STUDIO_CHAT_URL,
                                json={"model": "hermes", "messages": msgs, "temperature": 0.9, "stream": True}
                                ) as r:
-                r.raise_for_status()
+
+                time_before_raise_status = time.monotonic()
+                r.raise_for_status() # This confirms headers are received and status is OK
+                time_after_raise_status = time.monotonic()
+
+                headers_received_latency_ms = (time_after_raise_status - request_time_inner) * 1000
+                logging.info(f"LLM_HEADERS_RECEIVED (httpx.Client): HTTP headers received and status OK ({headers_received_latency_ms:.0f}ms from client.stream call)")
 
                 for chunk in r.iter_text():
                     if not first_token_received and chunk.strip():
-                        ttft = (time.monotonic() - request_time) * 1000
-                        logging.info(f"LLM_STREAM_TTFT (httpx.Client): First token data received ({ttft:.0f}ms): '{chunk.strip()[:60]}'")
+                        # This TTFT is now relative to when headers were confirmed OK
+                        ttft_from_headers_ok = (time.monotonic() - time_after_raise_status) * 1000
+                        # Overall TTFT from the very start of the hermes_chat function call (outer)
+                        ttft_overall = (time.monotonic() - request_time_outer) * 1000
+
+                        logging.info(f"LLM_STREAM_TTFT (httpx.Client): First token data received. Overall TTFT: {ttft_overall:.0f}ms. From Headers OK: {ttft_from_headers_ok:.0f}ms. Chunk: '{chunk.strip()[:60]}'")
                         first_token_received = True
 
                     if interruption_requested.is_set() or program_is_shutting_down.is_set():
@@ -612,6 +624,7 @@ def hermes_chat(msgs): # Modified for httpx Client
                         break
 
                     buffer += chunk
+                    # ... (rest of SSE processing) ...
                     while 'data: ' in buffer and '\n' in buffer:
                         event_start = buffer.find('data: ')
                         line_end = buffer.find('\n', event_start)
@@ -626,7 +639,7 @@ def hermes_chat(msgs): # Modified for httpx Client
                                 if 'content' in delta and delta['content'] is not None:
                                     yield delta['content']
                         except (json.JSONDecodeError, IndexError, KeyError): pass
-
+    # ... (rest of exception handling) ...
     except httpx.RequestError as e_req:
         if not program_is_shutting_down.is_set():
             logging.error(f"LLM_STREAM_REQUEST_ERROR (httpx.Client): LLM request failed: {e_req}", exc_info=True)
@@ -670,6 +683,17 @@ def play_startup_greeting_thread(audio_path_obj):
         logging.warning(f"GREETING_PLAY_ERROR: Error playing greeting '{audio_path_obj.name}': {e}", exc_info=True)
         # print(f"⚠️ Error playing greeting '{audio_path_obj.name}': {e}", file=sys.stderr) # UI
 
+
+def warmup_tts():
+    logging.info("TTS_WARMUP: Sending warmup request to Orpheus TTS...")
+    try:
+        warmup_text = "The system is ready."
+        payload = {"input": warmup_text, "model": "orpheus", "voice": VOICE, "response_format": "wav", "speed": 1.0}
+        response = requests.post(ORPHEUS_API_URL, json=payload, timeout=(5,10))
+        response.raise_for_status()
+        logging.info(f"TTS_WARMUP: Warmup request with '{warmup_text}' successful (status {response.status_code}). Duration: {response.elapsed.total_seconds()*1000:.0f}ms")
+    except Exception as e:
+        logging.warning(f"TTS_WARMUP_FAIL: Orpheus TTS warmup request failed: {e}")
 
 def main():
     global current_generation_id, REFERENCE_F0, PERSONA_TEMPLATE, SUMMARY_PROMPT # Ensure globals are intended
@@ -737,6 +761,8 @@ def main():
         threads.append(thread)
         thread.start()
         logging.info(f"MAIN_THREAD_START: Started thread: {name}")
+
+    warmup_tts()
 
     print("🎙️ System ready. Talk or type anytime. Check logs for detailed info.") # UI message
 
