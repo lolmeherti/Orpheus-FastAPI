@@ -2,495 +2,476 @@
 # -*- coding: utf-8 -*-
 # convo.py
 
-import json, os, pathlib, queue, re, sys, threading, traceback, uuid, random
+import json, os, queue, re, sys, threading, traceback, uuid, random, time, logging, pathlib
+from pathlib import Path
 from datetime import datetime
 from difflib import SequenceMatcher
-import time
 
-import numpy as np, requests, sounddevice as sd, soundfile as sf
+# Core libraries
+import numpy as np
+import requests
 import torch
 import whisper
 
-# --- NEW: Import the chunker library ---
+# Audio libraries
+import sounddevice as sd
+import soundfile as sf
+import pyaudio
+from pydub import AudioSegment
+
+# --- Custom Library Imports ---
 from streaming_chunker import StreamingChunker
+from audio_processing import preprocess_clip
+from prosody_fast import get_f0
+from filler_queue_builder import FillerQueueBuilder
 
 os.environ["NEMO_DISABLE_TQDM"] = "1"
 
 # --- VAD & ASR Configuration ---
-VAD_INTERRUPT_TIMEOUT_S           = 0.2
-VAD_DEFAULT_SILENCE_TIMEOUT_S     = 1.2
-VAD_LONG_PROMPT_TIMEOUT_S         = 2.0
-VAD_LONG_PROMPT_TRIGGER_S         = 3.0
+VAD_INTERRUPT_TIMEOUT_S = 0.2
+VAD_DEFAULT_SILENCE_TIMEOUT_S = 1.2
+VAD_LONG_PROMPT_TIMEOUT_S = 2.0
+VAD_LONG_PROMPT_TRIGGER_S = 3.0
 INTERRUPTION_DURATION_THRESHOLD_S = 4
-
-MIN_WORDS_ASR                     = 1
-VAD_MIN_SPEECH_S                  = 0.25
-VAD_SPEECH_CONFIDENCE_THRESHOLD   = 0.3
-ECHO_SIMILARITY_THRESHOLD         = 0.7
-
-WHISPER_BEAM_SIZE                 = 5
-WHISPER_LOGPROB_THRESHOLD         = -1.0
-WHISPER_NO_SPEECH_THRESHOLD       = 0.6
+MIN_WORDS_ASR = 1
+VAD_MIN_SPEECH_S = 0.25
+VAD_SPEECH_CONFIDENCE_THRESHOLD = 0.3
+ECHO_SIMILARITY_THRESHOLD = 0.7
 
 # --- Core Application Settings ---
 LM_STUDIO_CHAT_URL = "http://localhost:1234/v1/chat/completions"
-ORPHEUS_API_URL    = "http://127.0.0.1:5005/v1/audio/speech"
-VOICE              = "tara"
-MIN_WORDS_FOR_CHUNK= 8 # Parameter for the new StreamingChunker
-TOKEN_SOFT_LIMIT   = 2500
-TOKEN_HARD_LIMIT   = 7700
-KEEP_RECENT        = 2
+ORPHEUS_API_URL = "http://127.0.0.1:5005/v1/audio/speech"
+VOICE = "tara"
+MIN_WORDS_FOR_CHUNK = 8
+TOKEN_SOFT_LIMIT = 2500
+TOKEN_HARD_LIMIT = 7700
+KEEP_RECENT = 2
 
-# --- USER PATHS ---
-OUTPUT_DIR = pathlib.Path("outputs")
-CACHE_DIR  = pathlib.Path("../cached_clips")
+# --- USER PATHS (Corrected and Robust) ---
+SCRIPT_DIR = Path(__file__).parent.resolve()
+ROOT_DIR = SCRIPT_DIR.parent
+OUTPUT_DIR = SCRIPT_DIR / "outputs"
+CACHE_DIR = ROOT_DIR / "cached_clips"
+
+filler_builder = FillerQueueBuilder(
+    atomic_dir=CACHE_DIR / "atomic_fillers",
+    mid_dir=CACHE_DIR   / "mid_fillers"
+)
+
+SUMMARY_BOT_TEMPLATE = ROOT_DIR / "personas/chat_summary_bot.txt"
+PERSONA_PROMPT_TEMPLATE = ROOT_DIR / "personas/tts_default.txt"
+
 OUTPUT_DIR.mkdir(exist_ok=True)
-
-CLEANUP_FOLDERS = [
-    OUTPUT_DIR,
-    pathlib.Path("../outputs"),
-]
-
-SUMMARY_BOT_TEMPLATE    = pathlib.Path("../personas/chat_summary_bot.txt")
-PERSONA_PROMPT_TEMPLATE = pathlib.Path("../personas/tts_default.txt")
-
+CLEANUP_FOLDERS = [OUTPUT_DIR, ROOT_DIR / "outputs"]
 TTS_REQUEST_TIMEOUT = (10, 30)
-# --- Regex for filtering/history (minimal set) ---
-WORD_COUNT_THRESHOLD_FOR_TAGGED_SENTENCE_DISCARD = 2
-STANDALONE_TAG_RE = re.compile(r"^\s*<[^>]+>\s*$")
-ANY_BRACKETED_TAG_RE = re.compile(r"<[^>]+>")
-ACTION_RE = re.compile(r'\*[^\*]+\*|_[^_]+_|\([^)]+\)|[\U0001F300-\U0001F9FF]')
-LLM_SPECIAL_TOKENS_RE = re.compile(r'<\|.*?\|>')
 
+# ==============================================================================
+# == CENTRALIZED AUDIO CONFIGURATION ==
+# ==============================================================================
+REF_AUDIO_CLIP_PATH = CACHE_DIR / "alright_i_hear_you_pending_cache.wav"
+CROSSFADE_MS = 80
+CHUNK_MS = 20
+SILENCE_THRES_DB = -50
+FADE_IN_MS = 100
+TARGET_LUFS = -27.2
+SAFE_PAUSE_MS = 250
+EDGE_FADE_MS = 5
+REFERENCE_F0 = 0.0 # Pitch correction disabled by default
 
-try:
-    with open(PERSONA_PROMPT_TEMPLATE, "r", encoding="utf-8") as f:
-        PERSONA_TEMPLATE = f.read()
-    print(f"✅ Loaded default persona from: {PERSONA_PROMPT_TEMPLATE}")
-except FileNotFoundError:
-    print(f"‼️ FATAL: Persona file not found at '{PERSONA_PROMPT_TEMPLATE}'. Please ensure it exists.")
-    sys.exit(1)
-
-try:
-    with open(SUMMARY_BOT_TEMPLATE, "r", encoding="utf-8") as f:
-        SUMMARY_PROMPT = f.read()
-    print(f"✅ Loaded summarizer persona from: {SUMMARY_BOT_TEMPLATE}")
-except FileNotFoundError:
-    print(f"⚠️ WARNING: Summarizer persona file not found at '{SUMMARY_BOT_TEMPLATE}'. Using a default.")
-    SUMMARY_PROMPT = "You are a summarization bot. Your task is to update a running summary of a conversation."
-
+# --- Global State ---
 audio_q, prefetch_q, user_q, memory_q = (queue.Queue() for _ in range(4))
-
-interruption_requested = threading.Event()
-tts_actively_playing = threading.Event()
-program_is_shutting_down = threading.Event()
-INTERRUPT_KEYWORDS = {"stop", "shut up", "hold on", "wait", "enough", "nevermind", "cancel", "that's enough"}
-
+interruption_requested, tts_actively_playing, program_is_shutting_down = threading.Event(), threading.Event(), threading.Event()
+INTERRUPT_KEYWORDS = {"stop", "shut up", "hold on", "wait", "enough", "nevermind", "cancel"}
 last_tts_text = ""
 current_generation_id = None
 
-# --- HISTORY SANITATION: The only sanitation function left in this file ---
-def strip_action_and_emoji(text_input: str) -> str:
-    """Cleans the full text response before it's saved to chat history."""
-    if not isinstance(text_input, str): return ""
-    text = text_input
-    text = ANY_BRACKETED_TAG_RE.sub('', text)
-    text = ACTION_RE.sub('', text)
-    text = LLM_SPECIAL_TOKENS_RE.sub('',text)
-    text = re.sub(r'\s+', ' ', text).strip()
-    return text
+# --- Helper Functions ---
+def strip_action_and_emoji(text: str) -> str:
+    if not isinstance(text, str): return ""
+    text = re.sub(r"<[^>]+>", '', text)
+    text = re.sub(r'\*[^\*]+\*|_[^_]+_|\([^)]+\)|[\U0001F300-\U0001F9FF]', '', text)
+    text = re.sub(r'<\|.*?\|>', '', text)
+    return " ".join(text.split())
+
+def rough_tokens(txt: str) -> int:
+    return max(1, len(txt) // 4)
 
 # --- Worker Threads ---
 
 def asr_listener():
-    print("🎤 Loading Whisper ASR & Silero VAD…")
     try:
         asr_model = whisper.load_model("small.en")
-        print("🎤 Whisper 'small.en' model loaded.")
         vad_model, utils = torch.hub.load(repo_or_dir='snakers4/silero-vad', model='silero_vad', force_reload=False)
-        (get_speech_timestamps, save_audio, read_audio, VADIterator, collect_chunks) = utils
-        print("🎤 Silero VAD model loaded.")
     except Exception as e:
-        print(f"‼️ FATAL: Could not load ASR/VAD models: {e}"); traceback.print_exc()
-        program_is_shutting_down.set(); return
+        print(f"‼️ FATAL: Could not load ASR/VAD models: {e}"); program_is_shutting_down.set(); return
 
-    sr = 16000
-    vad_chunk_size = 512
-    min_speech_frames = int(VAD_MIN_SPEECH_S * 1000 / (vad_chunk_size / sr * 1000))
-    is_speaking = False; audio_buffer = []; silence_counter = 0
+    sr, vad_chunk_size = 16000, 512
+    is_speaking, audio_buffer, silence_counter = False, [], 0
 
     try:
-        with sd.InputStream(samplerate=sr, channels=1, dtype='float32', blocksize=vad_chunk_size, callback=None) as stream:
-            print("🎤 Continuous ASR listening (Literal Transcription Mode)…")
+        with sd.InputStream(samplerate=sr, channels=1, dtype='float32', blocksize=vad_chunk_size) as stream:
             while not program_is_shutting_down.is_set():
-                try:
-                    frame_float32, overflowed = stream.read(vad_chunk_size)
-                    if overflowed: print("‼️ Mic overflow!", file=sys.stderr); continue
-                    audio_tensor = torch.from_numpy(frame_float32.flatten())
-                    speech_confidence = vad_model(audio_tensor, sr).item()
-                    is_speech_in_frame = speech_confidence > VAD_SPEECH_CONFIDENCE_THRESHOLD
-                    if is_speaking:
-                        audio_buffer.append(frame_float32)
-                        if is_speech_in_frame:
-                            silence_counter = 0
-                        else:
-                            silence_counter += 1
-                            active_timeout_s = VAD_DEFAULT_SILENCE_TIMEOUT_S
-                            if tts_actively_playing.is_set():
-                                active_timeout_s = VAD_INTERRUPT_TIMEOUT_S
-                            else:
-                                current_audio_data = np.concatenate(audio_buffer).squeeze()
-                                if len(current_audio_data) > 0:
-                                    speech_timestamps = get_speech_timestamps(torch.from_numpy(current_audio_data), vad_model, sampling_rate=sr)
-                                    if speech_timestamps:
-                                        precise_speech_duration_s = (speech_timestamps[-1]['end'] - speech_timestamps[0]['start']) / sr
-                                        if precise_speech_duration_s > VAD_LONG_PROMPT_TRIGGER_S:
-                                            active_timeout_s = VAD_LONG_PROMPT_TIMEOUT_S
-                            silence_frames_needed = int(active_timeout_s / (vad_chunk_size / sr))
-                            if silence_counter >= silence_frames_needed:
-                                is_speaking = False
-                                end_of_speech_time = time.monotonic()
-                                if len(audio_buffer) >= min_speech_frames:
-                                    full_audio = np.concatenate(audio_buffer).squeeze()
-                                    txt = asr_model.transcribe(full_audio, fp16=torch.cuda.is_available())['text'].strip()
-                                    processing_lag_s = time.monotonic() - end_of_speech_time
-                                    if txt:
-                                        is_echo = False
-                                        if tts_actively_playing.is_set() and last_tts_text:
-                                            similarity = SequenceMatcher(None, txt.lower(), last_tts_text.lower()).ratio()
-                                            if similarity > ECHO_SIMILARITY_THRESHOLD:
-                                                print(f"🎤 Echo detected (Similarity: {similarity:.2f}), discarding.", file=sys.stderr); is_echo = True
-                                        if not is_echo and len(txt.split()) >= MIN_WORDS_ASR:
-                                            speech_duration_s = len(full_audio) / sr
-                                            print(f"\n🗣️ User (ASR): '{txt}' (Duration: {speech_duration_s:.2f}s, VAD Lag: {processing_lag_s:.2f}s)")
-                                            if tts_actively_playing.is_set() and not interruption_requested.is_set():
-                                                print("🎤 ASR: User spoke while TTS active -> Setting INTERRUPT_REQUESTED"); interruption_requested.set()
-                                            user_q.put((txt, speech_duration_s))
-                                audio_buffer = []
-                    elif is_speech_in_frame:
-                        is_speaking = True
+                frame, _ = stream.read(vad_chunk_size)
+                is_speech = vad_model(torch.from_numpy(frame.flatten()), sr).item() > VAD_SPEECH_CONFIDENCE_THRESHOLD
+                if is_speaking:
+                    audio_buffer.append(frame)
+                    if not is_speech:
+                        silence_counter += 1
+                        active_timeout_s = VAD_INTERRUPT_TIMEOUT_S if tts_actively_playing.is_set() else VAD_DEFAULT_SILENCE_TIMEOUT_S
+                        if len(audio_buffer) * (vad_chunk_size / sr) > VAD_LONG_PROMPT_TRIGGER_S:
+                            active_timeout_s = VAD_LONG_PROMPT_TIMEOUT_S
+
+                        if silence_counter * (vad_chunk_size / sr) >= active_timeout_s:
+                            is_speaking = False
+                            full_audio = np.concatenate(audio_buffer).squeeze()
+                            audio_buffer = []
+                            if len(full_audio) / sr >= VAD_MIN_SPEECH_S:
+                                txt = asr_model.transcribe(full_audio, fp16=torch.cuda.is_available())['text'].strip()
+                                if txt:
+                                    is_echo = SequenceMatcher(None, txt.lower(), last_tts_text.lower()).ratio() > ECHO_SIMILARITY_THRESHOLD if last_tts_text else False
+                                    if not is_echo and len(txt.split()) >= MIN_WORDS_ASR:
+                                        print(f"\n🗣️ User: '{txt}'")
+                                        if tts_actively_playing.is_set():
+                                            interruption_requested.set()
+                                        user_q.put((txt, len(full_audio) / sr))
+                    else:
                         silence_counter = 0
-                        audio_buffer = [frame_float32]
-                        if not tts_actively_playing.is_set(): print("\n🎤 Speech detected…", end='', flush=True)
-                except sd.PortAudioError as pae:
-                    if "Input overflowed" in str(pae): print("‼️ Mic overflow (PortAudioError)!", file=sys.stderr); continue
-                    print(f"‼️ ASR PortAudioError: {pae}", file=sys.stderr); sd.sleep(1)
-                except Exception as e:
-                    if program_is_shutting_down.is_set(): break
-                    print(f"‼️ ASR loop error: {e}", file=sys.stderr); traceback.print_exc(); is_speaking = False; audio_buffer = []; silence_counter = 0; sd.sleep(1)
-    except Exception as e: print(f"‼️ ASR: Could not open InputStream: {e}"); traceback.print_exc()
-    print("🎤 ASR listener thread finished.")
+                elif is_speech:
+                    is_speaking, silence_counter = True, 0
+                    audio_buffer = [frame]
+    except Exception as e:
+        if not program_is_shutting_down.is_set(): print(f"‼️ ASR Error: {e}")
 
 def kb_listener():
-    print("⌨️ Keyboard listener started.")
     while not program_is_shutting_down.is_set():
         try:
             line = input("\n⌨️  ").strip()
             if program_is_shutting_down.is_set(): break
             if line:
                 if tts_actively_playing.is_set() and line.lower() in INTERRUPT_KEYWORDS:
-                    print(f"⌨️ Interrupt command: '{line}' -> Setting INTERRUPT_REQUESTED")
-                    if not interruption_requested.is_set(): interruption_requested.set()
+                    interruption_requested.set()
                 user_q.put((line, 0.0))
-        except EOFError: print("⌨️ EOF received, exiting keyboard listener."); break
-        except KeyboardInterrupt: print("\n⌨️ Keyboard interrupt in listener. Exiting."); break
-        except Exception as e:
-            if program_is_shutting_down.is_set(): break
-            print(f"‼️ KB Listener error: {e}"); traceback.print_exc(); break
-    print("⌨️ Keyboard listener thread finished.")
+        except (EOFError, KeyboardInterrupt):
+            break
 
-def audio_player():
+def audio_player_thread():
     global last_tts_text
-    print("🎵 Audio player thread started.")
-    player_active_gen_id = None
+    pa = pyaudio.PyAudio()
+    stream = None
+    active_gen_id = None
+    current_stream_rate = None
+    prev_tail = np.array([], dtype=np.int16)
+
+    def open_stream(rate):
+        nonlocal stream, current_stream_rate
+        if stream: stream.stop_stream(); stream.close()
+        stream = pa.open(format=pyaudio.paInt16, channels=1, rate=rate, output=True, frames_per_buffer=int(rate * CHUNK_MS / 1000))
+        current_stream_rate = rate
+        return stream
+
+    def play_audio_data(data, sr):
+        nonlocal stream, prev_tail
+        if not stream or current_stream_rate != sr: stream = open_stream(sr)
+        fade_len = min(len(prev_tail), len(data))
+        if fade_len > 0:
+            fade_out = np.linspace(1, 0, fade_len, dtype=np.float32)
+            fade_in = np.linspace(0, 1, fade_len, dtype=np.float32)
+            blend = (prev_tail[:fade_len] * fade_out + data[:fade_len] * fade_in).astype(np.int16)
+            data_to_play = np.concatenate((blend, data[fade_len:]))
+        else:
+            data_to_play = data
+        stream.write(data_to_play.tobytes())
+        tail_size = int(sr * CROSSFADE_MS / 1000)
+        prev_tail = data[-tail_size:]
+
     while not program_is_shutting_down.is_set():
         try:
-            gen_id, p_path_obj, text_that_was_spoken = audio_q.get(timeout=0.1)
+            gen_id, data, text = audio_q.get(timeout=1.0)
+            if data is None: break # Shutdown signal
+
+            if text == "[PAUSE]":
+                if not interruption_requested.is_set():
+                    time.sleep(data / 1000.0)
+                audio_q.task_done()
+                continue
+
+            p_path_obj = data
+
+            try:
+                if gen_id != active_gen_id:
+                    active_gen_id = gen_id; prev_tail = np.array([], dtype=np.int16)
+                if interruption_requested.is_set(): continue
+
+                tts_actively_playing.set()
+                was_filler = text == "[FILLER]"
+
+                if was_filler:
+                    logging.info(f"⏳ Filler: {p_path_obj.name}")
+                else:
+                    logging.info(f"🎵 TTS: '{text}'")
+                    last_tts_text = text
+
+                current_samples, sr = sf.read(str(p_path_obj), dtype='int16')
+                play_audio_data(current_samples, sr)
+
+                while not interruption_requested.is_set():
+                    try:
+                        next_gen_id, next_data, next_text = audio_q.get(timeout=0.65)
+                        if next_gen_id != gen_id:
+                            audio_q.put((next_gen_id, next_data, next_text)); break
+
+                        if next_text == "[PAUSE]":
+                            if not interruption_requested.is_set():
+                                time.sleep(next_data / 1000.0)
+                            audio_q.task_done()
+                            continue
+
+                        next_path = next_data
+
+                        if next_text == "[FILLER]":
+                             logging.info(f"⏳ Filler: {next_path.name}")
+                        else:
+                             logging.info(f"🎵 TTS: '{next_text}'")
+                             last_tts_text = next_text
+
+                        tts_samples, tts_sr = sf.read(str(next_path), dtype='int16')
+                        if tts_sr == sr:
+                            play_audio_data(tts_samples, sr)
+                        else:
+                            play_audio_data(tts_samples, tts_sr)
+                            sr = tts_sr
+
+                        if next_path.exists() and not next_path.is_relative_to(CACHE_DIR):
+                            next_path.unlink(missing_ok=True)
+                        audio_q.task_done()
+                    except queue.Empty: break
+            finally:
+                audio_q.task_done()
+
         except queue.Empty:
-            if not tts_actively_playing.is_set(): player_active_gen_id = None
-            continue
-        if p_path_obj is None: print("🎵 AudioPlayer: Shutdown sentinel received."); break
-        if interruption_requested.is_set():
-            if p_path_obj and p_path_obj.exists() and not p_path_obj.is_relative_to(CACHE_DIR):
-                 p_path_obj.unlink(missing_ok=True)
-            player_active_gen_id = None; audio_q.task_done(); continue
-        if player_active_gen_id is None:
-            if gen_id != current_generation_id:
-                print(f"🎵 AudioPlayer: Discarding stale audio chunk. File: {p_path_obj.name if p_path_obj else 'N/A'}", file=sys.stderr)
-                if p_path_obj and p_path_obj.exists() and not p_path_obj.is_relative_to(CACHE_DIR):
-                    p_path_obj.unlink(missing_ok=True)
-                audio_q.task_done(); continue
-            player_active_gen_id = gen_id
-        elif gen_id != player_active_gen_id:
-            print(f"🎵 AudioPlayer: Gen ID mismatch. Discarding. File: {p_path_obj.name if p_path_obj else 'N/A'}", file=sys.stderr)
-            if p_path_obj and p_path_obj.exists() and not p_path_obj.is_relative_to(CACHE_DIR):
-                p_path_obj.unlink(missing_ok=True)
-            audio_q.task_done(); continue
-        is_filler_audio = (text_that_was_spoken == "[FILLER_AUDIO]")
-        try:
-            if not p_path_obj or not p_path_obj.exists():
-                print(f"🎵 AudioPlayer: Audio file path is invalid: {p_path_obj}", file=sys.stderr)
-                audio_q.task_done(); continue
-            data, sr_audio = sf.read(str(p_path_obj), dtype="float32")
-            last_tts_text_candidate = text_that_was_spoken
-            tts_actively_playing.set()
-            if is_filler_audio: print(f"🎵 Playing FILLER audio: {p_path_obj.name}")
-            else: print(f"🎵 Playing TTS: '{text_that_was_spoken}' ({p_path_obj.name})")
-            sd.play(data, sr_audio); sd.wait()
-            if not is_filler_audio: last_tts_text = last_tts_text_candidate
-        except Exception as e: print(f"‼️ Audio playback error for '{p_path_obj}': {e}", file=sys.stderr); traceback.print_exc()
-        finally:
-            tts_actively_playing.clear()
-            if not is_filler_audio and last_tts_text == text_that_was_spoken:
-                 last_tts_text = ""
-            if p_path_obj and p_path_obj.exists() and not p_path_obj.is_relative_to(CACHE_DIR):
-                try: p_path_obj.unlink(missing_ok=True)
-                except Exception: pass
-            audio_q.task_done()
-    print("🎵 Audio player thread finished.")
+            if tts_actively_playing.is_set():
+                active_gen_id = None; tts_actively_playing.clear(); last_tts_text = ""
+        except Exception as e:
+            print(f"‼️ Audio Player Error: {e}")
+
+    if stream: stream.close()
+    pa.terminate()
+
 
 def tts_requester_thread(text_chunk, generation_id):
     try:
-        if program_is_shutting_down.is_set() or generation_id != current_generation_id: return
-        audio_file = tts_request(text_chunk, generation_id)
-        if audio_file:
-            audio_q.put((generation_id, audio_file, text_chunk))
-    except Exception as e: print(f"‼️ TTS Requester Thread error for chunk '{text_chunk[:30]}...': {e}"); traceback.print_exc()
+        if program_is_shutting_down.is_set() or (current_generation_id and generation_id != current_generation_id): return
+        raw_audio_path = tts_request(text_chunk, generation_id)
+        if not raw_audio_path: return
+
+        raw_segment = AudioSegment.from_file(raw_audio_path, "wav")
+        processed_segment = preprocess_clip(
+            seg=raw_segment, ref_f0=REFERENCE_F0, silence_thresh_db=SILENCE_THRES_DB,
+            safe_pause_ms=SAFE_PAUSE_MS, edge_fade_ms=EDGE_FADE_MS,
+            fade_in_ms=FADE_IN_MS, target_lufs=TARGET_LUFS
+        )
+        processed_segment.export(raw_audio_path, format="wav")
+        audio_q.put((generation_id, raw_audio_path, text_chunk))
+    except Exception as e:
+        print(f"‼️ TTS Requester Error for '{text_chunk[:30]}...': {e}")
 
 def prefetch_worker():
-    print("⏳ Prefetch worker thread started.")
     while not program_is_shutting_down.is_set():
         try:
             generation_id, chunks_to_prefetch = prefetch_q.get(timeout=0.2)
+            if chunks_to_prefetch is None: break
+            if generation_id != current_generation_id:
+                prefetch_q.task_done(); continue
+
+            fetch_threads = []
+            for text_chunk in chunks_to_prefetch:
+                if program_is_shutting_down.is_set() or interruption_requested.is_set(): break
+                if not text_chunk.strip() or re.fullmatch(r"<[^>]+>", text_chunk.strip()): continue
+                thread = threading.Thread(target=tts_requester_thread, args=(text_chunk, generation_id))
+                thread.daemon = True; fetch_threads.append(thread); thread.start()
+            for thread in fetch_threads: thread.join()
+            prefetch_q.task_done()
         except queue.Empty: continue
-        if chunks_to_prefetch is None: print("⏳ Prefetch worker: Shutdown sentinel received."); break
-        if generation_id != current_generation_id: prefetch_q.task_done(); continue
 
-        fetch_threads = []
-        for text_chunk in chunks_to_prefetch:
-            if program_is_shutting_down.is_set() or interruption_requested.is_set() or generation_id != current_generation_id:
-                break
-
-            # This secondary filter remains as a simple safeguard.
-            if STANDALONE_TAG_RE.fullmatch(text_chunk.strip()):
-                print(f"PREFETCH_FILTER: DISCARDING standalone tag: '{text_chunk[:50]}'", file=sys.stderr)
-                continue
-
-            thread = threading.Thread(target=tts_requester_thread, args=(text_chunk, generation_id))
-            thread.daemon = True; fetch_threads.append(thread); thread.start()
-
-        for thread in fetch_threads:
-            thread.join()
-
-        prefetch_q.task_done()
-    print("⏳ Prefetch worker thread finished.")
-
-rough_tokens = lambda txt: max(1, len(txt)//4)
-
-def summarise(prev_summary, new_transcript):
-    if program_is_shutting_down.is_set(): return prev_summary or "[summary skipped]"
+def tts_request(txt, generation_id):
+    if not txt or (current_generation_id and generation_id != current_generation_id): return None
     try:
-        content = f"PREVIOUS SUMMARY:\n{prev_summary or 'None.'}\n\nNEW TRANSCRIPT TO ADD:\n{new_transcript}"
-        r = requests.post(LM_STUDIO_CHAT_URL, json={"model": "hermes", "messages": [{"role": "system", "content": SUMMARY_PROMPT}, {"role": "user", "content": content}], "temperature": 0.6, "max_tokens": 1024}, timeout=200)
-        r.raise_for_status(); summary_text = r.json()['choices'][0]['message']['content'].strip()
-        if summary_text.lower().startswith("updated summary:"): summary_text = summary_text.split(":", 1)[1].strip()
-        return summary_text
-    except Exception as e: print(f"‼️ Summary failed: {e}", file=sys.stderr); return prev_summary or "[summary failed]"
+        payload = {"input": txt, "model": "orpheus", "voice": VOICE, "response_format": "wav", "speed": 1.0}
+        wav_data = requests.post(ORPHEUS_API_URL, json=payload, timeout=TTS_REQUEST_TIMEOUT).content
+        if len(wav_data) < 1000: return None
+        file_name = f"{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}.wav"
+        output_path = OUTPUT_DIR / file_name
+        output_path.write_bytes(wav_data)
+        return output_path
+    except requests.exceptions.RequestException as e:
+        print(f"‼️ TTS API failed for '{txt[:30]}...': {e}"); return None
+
+def cleanup_old_audio():
+    for folder in set(CLEANUP_FOLDERS):
+        if not folder.is_dir(): continue
+        for f in folder.glob("*.wav"):
+            try:
+                resolved_f = f.resolve()
+                if (CACHE_DIR.is_dir() and CACHE_DIR.resolve() in resolved_f.parents):
+                    continue
+                f.unlink(missing_ok=True)
+            except Exception as e: print(f"🧹 Could not delete {f}: {e}")
 
 def hermes_chat(msgs):
-    llm_response_stream = None
     try:
-        llm_response_stream = requests.post(LM_STUDIO_CHAT_URL, json={"model":"hermes","messages":msgs,"temperature":0.9,"stream":True}, stream=True,timeout=(10,60))
-        llm_response_stream.raise_for_status()
+        r = requests.post(LM_STUDIO_CHAT_URL, json={"model":"hermes","messages":msgs,"temperature":0.9,"stream":True}, stream=True,timeout=(10,60))
+        r.raise_for_status()
+        r.encoding = 'utf-8'
         buffer = ""
-        for chunk in llm_response_stream.iter_content(chunk_size=None, decode_unicode=True):
-            if program_is_shutting_down.is_set() or interruption_requested.is_set():
-                print("\n🚫 LLM stream interrupted.", file=sys.stderr); break
+        for chunk in r.iter_content(chunk_size=None, decode_unicode=True):
+            if interruption_requested.is_set() or program_is_shutting_down.is_set(): break
             buffer += chunk
             while 'data: ' in buffer and '\n' in buffer:
                 event_start = buffer.find('data: ')
                 line_end = buffer.find('\n', event_start)
                 if line_end == -1: break
                 line = buffer[event_start:line_end]
-                try:
-                    data = line.split('data: ', 1)[1].strip()
-                    if data == '[DONE]':
-                        buffer = buffer[line_end+1:]; return
-                    if data:
-                        delta = json.loads(data)['choices'][0]['delta']
-                        if 'content' in delta:
-                            yield delta['content']
-                except (json.JSONDecodeError, IndexError):
-                    pass # Incomplete data, wait for more
                 buffer = buffer[line_end+1:]
-    except requests.exceptions.RequestException as e: print(f"‼️ Hermes network error: {e}", file=sys.stderr)
-    except Exception as e: print(f"‼️ Unhandled Hermes error: {e}", file=sys.stderr); traceback.print_exc()
-    finally:
-        if llm_response_stream:
-            try: llm_response_stream.close()
-            except Exception: pass
-
-def tts_request(txt, generation_id):
-    if program_is_shutting_down.is_set() or (generation_id is not None and generation_id != current_generation_id):
-        return None
-
-    # The 'txt' payload is now received pre-sanitized from the chunker.
-    if not txt:
-        return None
-
-    try:
-        wav_data = requests.post(ORPHEUS_API_URL,json={"input": txt,"model":"orpheus","voice":VOICE,"response_format":"wav","speed":1.0},timeout=TTS_REQUEST_TIMEOUT).content
-        if len(wav_data) < 1000:
-             print(f"🎤 TTS: Short/Invalid WAV received for '{txt[:30]}...'. Skipping.", file=sys.stderr); return None
-        file_name = datetime.utcnow().strftime("%Y%m%d_%H%M%S_")+uuid.uuid4().hex[:8]+".wav"; output_path = OUTPUT_DIR/file_name
-        output_path.write_bytes(wav_data); return output_path
-    except requests.exceptions.RequestException as e:
-        print(f"‼️ TTS API failed for '{txt[:30]}...': {e}", file=sys.stderr); return None
+                try:
+                    data_str = line.split('data: ', 1)[1].strip()
+                    if data_str == '[DONE]': return
+                    if data_str:
+                        delta = json.loads(data_str)['choices'][0]['delta']
+                        if 'content' in delta: yield delta['content']
+                except (json.JSONDecodeError, IndexError): pass
     except Exception as e:
-        print(f"‼️ TTS error for '{txt[:30]}...': {e}", file=sys.stderr); traceback.print_exc(); return None
+        if not program_is_shutting_down.is_set(): print(f"‼️ Hermes Error: {e}")
 
-def cleanup_old_audio():
-    print("🧹 Cleaning up old audio files...")
-    count = 0
-    for folder_path in CLEANUP_FOLDERS:
-        if not folder_path.is_dir(): continue
-        for audio_file in folder_path.glob("*.wav"):
-            try:
-                if CACHE_DIR.resolve() in audio_file.resolve().parents:
-                    continue
-                audio_file.unlink(); count += 1
-            except Exception as e: print(f"🧹 Could not delete {audio_file}: {e}", file=sys.stderr)
-    if count > 0: print(f"🧹 Removed {count} old .wav file(s).")
+def summarise(prev_summary, new_transcript):
+    try:
+        content = f"PREVIOUS SUMMARY:\n{prev_summary or 'None.'}\n\nNEW TRANSCRIPT TO ADD:\n{new_transcript}"
+        r = requests.post(LM_STUDIO_CHAT_URL, json={"model": "hermes", "messages": [{"role": "system", "content": SUMMARY_PROMPT}, {"role": "user", "content": content}], "temperature": 0.6, "max_tokens": 1024}, timeout=200)
+        r.raise_for_status()
+        r.encoding = 'utf-8'
+        summary_text = r.json()['choices'][0]['message']['content'].strip()
+        return summary_text.replace("Updated Summary:", "").strip()
+    except Exception: return prev_summary or "[summary failed]"
+
+def play_startup_greeting_thread(audio_path_obj):
+    try:
+        data_audio, sr_audio = sf.read(audio_path_obj, dtype='float32')
+        sd.play(data_audio, sr_audio)
+        sd.wait()
+    except Exception as e: print(f"⚠️ Error playing greeting '{audio_path_obj.name}': {e}", file=sys.stderr)
 
 def main():
-    global current_generation_id
+    global current_generation_id, REFERENCE_F0, PERSONA_TEMPLATE, SUMMARY_PROMPT
+
+    logging.basicConfig(level=logging.INFO, format='%(message)s')
     cleanup_old_audio()
     interruption_requested.clear(); tts_actively_playing.clear(); program_is_shutting_down.clear()
-    chat_history=[{"role":"system","content":PERSONA_TEMPLATE}]; current_memories = ""
+    chat_history=[{"role":"system","content":""}]; current_memories = ""
 
-    interrupt_audio_files, pending_audio_files, long_query_audio_files = [], [], []
     if CACHE_DIR.is_dir():
         interrupt_audio_files = list(CACHE_DIR.glob("*_interrupt_cache.wav"))
-        pending_audio_files = list(CACHE_DIR.glob("*_pending_cache.wav"))
-        long_query_audio_files = list(CACHE_DIR.glob("*_long_query_cache.wav"))
-        if interrupt_audio_files: print(f"🎤 Found {len(interrupt_audio_files)} interrupt acknowledgement clips.")
-        if pending_audio_files: print(f"🎤 Found {len(pending_audio_files)} pending clips.")
-        if long_query_audio_files: print(f"🎤 Found {len(long_query_audio_files)} long query clips.")
-    else: print(f"🎤 WARNING: Cache directory '{CACHE_DIR}' not found, filler audio will be disabled.")
+        greeting_files = list(CACHE_DIR.glob("*_greeting_cache.wav"))
+    else:
+        interrupt_audio_files, greeting_files = [], []
+
+    if greeting_files:
+        chosen_greeting_path = random.choice(greeting_files)
+        logging.info(f"👋 Greeting: {chosen_greeting_path.name}")
+        greeting_thread = threading.Thread(target=play_startup_greeting_thread, args=(chosen_greeting_path,), daemon=True)
+        greeting_thread.start()
 
     def memory_manager_worker():
-        nonlocal current_memories; print("🧠 Memory manager thread started.")
+        nonlocal current_memories
         while not program_is_shutting_down.is_set():
-            try: prev_mems, transcript_to_add = memory_q.get(timeout=0.2)
+            try:
+                prev_mems, transcript_to_add = memory_q.get(timeout=0.2)
+                if prev_mems is None: break
+                current_memories = summarise(prev_mems, transcript_to_add)
+                memory_q.task_done()
             except queue.Empty: continue
-            if prev_mems is None and transcript_to_add is None: print("🧠 Memory manager shutdown.");break
-            current_memories = summarise(prev_mems, transcript_to_add)
-            print(f"🔹 Memories updated to: '{current_memories[:100].replace(os.linesep, ' ')}...'")
-            memory_q.task_done()
-        print("🧠 Memory manager thread finished.")
 
-    threads = [(threading.Thread(target=f,daemon=d, name=n)) for f,d,n in [
-            (audio_player,True,"AudioPlayerThread"), (prefetch_worker,True,"PrefetchThread"),
-            (asr_listener,True,"ASRListenerThread"), (kb_listener,True,"KBListenerThread"),
-            (memory_manager_worker,True,"MemoryManagerThread")]]
-    for t in threads: t.start()
-    print("🎙️  Talk or type anytime — 'quit' to exit, 'mem'/'dump' commands, or interrupt (e.g., 'stop').")
+    thread_targets = [
+        (audio_player_thread, "AudioPlayerThread"),
+        (prefetch_worker, "PrefetchThread"), (asr_listener, "ASRListenerThread"),
+        (kb_listener, "KBListenerThread"), (memory_manager_worker, "MemoryManagerThread")
+    ]
+    threads = [threading.Thread(target=t, name=n, daemon=True) for t, n in thread_targets]
+    for thread in threads: thread.start()
+
+    print("🎙️ System ready. Talk or type anytime.")
 
     try:
         while not program_is_shutting_down.is_set():
             try:
-                current_user_input, speech_duration = user_q.get(timeout=0.2)
+                current_user_input, _ = user_q.get(timeout=0.2)
                 user_q.task_done()
             except queue.Empty:
                 if program_is_shutting_down.is_set(): break
                 continue
 
-            was_an_interruption = interruption_requested.is_set()
-
-            if was_an_interruption:
-                print("MAIN: Interruption detected. Cleaning up...")
-                sd.stop(); tts_actively_playing.clear()
-                for q in [audio_q, prefetch_q]:
-                    while not q.empty():
-                        try: q.get_nowait(); q.task_done()
-                        except Exception: pass
+            if interruption_requested.is_set():
+                sd.stop()
+                while not audio_q.empty():
+                    try: audio_q.get_nowait(); audio_q.task_done()
+                    except queue.Empty: break
+                while not prefetch_q.empty():
+                    try: prefetch_q.get_nowait(); prefetch_q.task_done()
+                    except queue.Empty: break
 
                 if interrupt_audio_files:
                     try:
-                        clip_to_play = random.choice(interrupt_audio_files)
-                        data_int, sr_int = sf.read(str(clip_to_play), dtype='float32')
+                        data_int, sr_int = sf.read(random.choice(interrupt_audio_files), dtype='float32')
                         sd.play(data_int, sr_int); sd.wait()
                     except Exception as e: print(f"‼️ Could not play interrupt clip: {e}", file=sys.stderr)
-
                 interruption_requested.clear()
-                print("MAIN: Interruption processed.")
 
-                is_stop_command = any(keyword in current_user_input.lower().strip(".?!, ") for keyword in INTERRUPT_KEYWORDS)
-                if is_stop_command:
-                    print("INFO: Stop command received. Awaiting next input.")
-                    current_generation_id = None
-                    continue
-                else:
-                    print("INFO: Barge-in with new prompt. Proceeding.")
+                if any(keyword in current_user_input.lower().strip(".?!, ") for keyword in INTERRUPT_KEYWORDS):
+                    current_generation_id = None; continue
 
             current_generation_id = uuid.uuid4()
 
-            if not was_an_interruption and speech_duration > 0.1:
-                filler_clip_to_play = None
-                if speech_duration > INTERRUPTION_DURATION_THRESHOLD_S and long_query_audio_files:
-                    filler_clip_to_play = random.choice(long_query_audio_files)
-                elif pending_audio_files:
-                    filler_clip_to_play = random.choice(pending_audio_files)
-                if filler_clip_to_play:
-                    audio_q.put((current_generation_id, filler_clip_to_play, "[FILLER_AUDIO]"))
+            for item in filler_builder.build_queue_items():
+                if isinstance(item, Path):
+                    audio_q.put((current_generation_id, item, "[FILLER]"))
+                elif isinstance(item, int):
+                    audio_q.put((current_generation_id, item, "[PAUSE]"))
 
             if current_user_input.lower() in {"quit","exit"}: program_is_shutting_down.set(); break
             if current_user_input.lower() == "mem": print(f"\n--- MEMORY ---\n{current_memories or '[none]'}\n---"); continue
             if current_user_input.lower() == "dump": [print(f"[{m['role']}] {m['content']}") for m in chat_history]; print("---"); continue
 
+            system_prompt = PERSONA_TEMPLATE + (f"\n\n--- CONVERSATION MEMORIES ---\n{current_memories}" if current_memories else "")
             messages_for_llm = list(chat_history)
-            system_prompt = PERSONA_TEMPLATE
-            if current_memories:
-                system_prompt += f"\n\n--- CONVERSATION MEMORIES ---\n{current_memories}"
             messages_for_llm[0] = {"role": "system", "content": system_prompt}
             messages_for_llm.append({"role": "user", "content": current_user_input})
-
-            print(f"🤖 Assistant thinking... (Gen: {current_generation_id})", end='', flush=True, file=sys.stderr)
 
             llm_full_response = ""
             try:
                 chunker_instance = StreamingChunker(min_words=MIN_WORDS_FOR_CHUNK)
+                token_stream = (token for token in hermes_chat(messages_for_llm))
 
-                def token_tee(token_iterator):
-                    nonlocal llm_full_response
-                    for token in token_iterator:
-                        llm_full_response += token
-                        yield token
-                        print(token, end='', flush=True, file=sys.stderr)
-
-                token_stream = token_tee(hermes_chat(messages_for_llm))
-
-                for i, sanitized_chunk in enumerate(chunker_instance.chunker(token_stream)):
-                    if i == 0: print(file=sys.stderr) # Newline after "thinking..."
+                for sanitized_chunk in chunker_instance.chunker(token_stream):
                     if interruption_requested.is_set(): break
-
                     prefetch_q.put((current_generation_id, [sanitized_chunk]))
+                    llm_full_response += sanitized_chunk + " "
 
                 if interruption_requested.is_set():
                     if current_user_input: chat_history.append({"role": "user", "content": current_user_input})
                     continue
 
             except Exception as e:
-                print(f"\n‼️ Error during LLM streaming/chunking: {e}", file=sys.stderr); traceback.print_exc()
+                print(f"\n‼️ Error during LLM streaming/chunking: {e}", file=sys.stderr)
                 if current_user_input: chat_history.append({"role": "user", "content": current_user_input})
                 continue
 
             assistant_response_for_chat_history = strip_action_and_emoji(llm_full_response)
+            if assistant_response_for_chat_history.strip():
+                print(f"🤖 Assistant: {assistant_response_for_chat_history}")
+
             if not assistant_response_for_chat_history.strip():
                 if current_user_input: chat_history.append({"role": "user", "content": current_user_input})
                 continue
 
-            if current_user_input: chat_history.append({"role": "user", "content": current_user_input})
+            chat_history.append({"role": "user", "content": current_user_input})
             chat_history.append({"role": "assistant", "content": assistant_response_for_chat_history})
 
             total_tokens_in_history = sum(rough_tokens(m['content']) for m in chat_history)
@@ -500,27 +481,29 @@ def main():
                     messages_to_summarize = chat_history[1:-(messages_to_retain)]
                     if messages_to_summarize:
                         transcript_to_summarize = "\n".join(f"{m['role']}: {m['content']}" for m in messages_to_summarize)
-                        print(f"🧠 Pruning chat. Summarizing {len(messages_to_summarize)} messages.")
                         memory_q.put((current_memories, transcript_to_summarize))
                         chat_history = [chat_history[0]] + chat_history[-(messages_to_retain):]
 
             while sum(rough_tokens(m['content']) for m in chat_history) > TOKEN_HARD_LIMIT:
-                if len(chat_history) > 2:
-                    print(f"‼️ HARD TOKEN PRUNING: Removing '{chat_history[1]['content'][:30]}...'")
-                    del chat_history[1]
+                if len(chat_history) > 2: del chat_history[1]
                 else: break
 
-    except KeyboardInterrupt: print("\n🚨 Main loop interrupted by user.");
+    except KeyboardInterrupt: print("\n🚨 Shutting down...");
     except Exception as e: print(f"‼️ UNHANDLED EXCEPTION IN MAIN: {e}"); traceback.print_exc()
     finally:
-        print("🛑 Shutting down...")
-        if not program_is_shutting_down.is_set(): program_is_shutting_down.set()
+        program_is_shutting_down.set()
         audio_q.put((None, None, None)); prefetch_q.put((None, None)); memory_q.put((None,None))
-        active_threads = [t for t in threads if t.is_alive()]
-        for t in active_threads:
-            t.join(timeout=2.0)
-            if t.is_alive(): print(f"⚠️ {t.name} did not join cleanly.")
-        print("🧹 Final cleanup..."); cleanup_old_audio(); print("👋 Goodbye!")
+        for t in threads: t.join(timeout=2.0)
+        cleanup_old_audio()
+        print("👋 Goodbye!")
 
-if __name__=="__main__":
-    main()
+if __name__ == "__main__":
+    try:
+        with open(PERSONA_PROMPT_TEMPLATE, "r", encoding="utf-8") as f: PERSONA_TEMPLATE = f.read()
+        with open(SUMMARY_BOT_TEMPLATE, "r", encoding="utf-8") as f: SUMMARY_PROMPT = f.read()
+        main()
+    except FileNotFoundError as e:
+        print(f"‼️ FATAL: A required persona file is missing: {e}. Please check your paths.")
+        sys.exit(1)
+    except Exception as e:
+        print(f"‼️ An unexpected startup error occurred: {e}"); traceback.print_exc()
