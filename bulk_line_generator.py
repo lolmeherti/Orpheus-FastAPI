@@ -92,6 +92,7 @@ import asyncio
 from pathlib import Path
 from typing import List, Tuple
 import httpx
+from itertools import islice
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
 ROOT_DIR = SCRIPT_DIR
@@ -108,69 +109,40 @@ VOICE = "tara"
 #
 # Placeholder for AI generation:
 LINES: dict[str, List[Tuple[str, float]]] = {
-    "philosophical": [
-        ("Replace me.", 1.0),
-        ("Replace me.", 1.0),
-        ("Replace me.", 1.0),
-        ("Replace me.", 1.0),
-        ("Replace me.", 1.0)
-    ],
-    "emergency": [
-        ("Replace me.", 1.0),
-        ("Replace me.", 1.0),
-        ("Replace me.", 1.0),
-        ("Replace me.", 1.0),
-        ("Replace me.", 1.0)
-    ],
-    "grief": [
-        ("Replace me.", 1.0),
-        ("Replace me.", 1.0),
-        ("Replace me.", 1.0),
-        ("Replace me.", 1.0),
-        ("Replace me.", 1.0)
-    ],
-    "intimate": [
-        ("Replace me.", 1.0),
-        ("Replace me.", 1.0),
-        ("Replace me.", 1.0),
-        ("Replace me.", 1.0),
-        ("Replace me.", 1.0)
-    ],
-    "banter": [
-        ("Replace me.", 1.0),
-        ("Replace me.", 1.0),
-        ("Replace me.", 1.0),
-        ("Replace me.", 1.0),
-        ("Replace me.", 1.0)
-    ],
-    "affirming": [
-        ("Replace me.", 1.0),
-        ("Replace me.", 1.0),
-        ("Replace me.", 1.0),
-        ("Replace me.", 1.0),
-        ("Replace me.", 1.0)
-    ],
+#     "philosophical": [
+#
+#     ],
+#     "emergency": [
+#
+#     ],
+#     "grief": [
+#
+#     ],
+#     "intimate": [
+#
+#     ],
+#     "banter": [
+#
+#     ],
+#     "affirming": [
+#
+#     ],
     "neutral": [
-        ("Replace me.", 1.0),
-        ("Replace me.", 1.0),
-        ("Replace me.", 1.0),
-        ("Replace me.", 1.0),
-        ("Replace me.", 1.0)
-    ],
-    "flirt": [
-        ("Replace me.", 1.0),
-        ("Replace me.", 1.0),
-        ("Replace me.", 1.0),
-        ("Replace me.", 1.0),
-        ("Replace me.", 1.0)
-    ],
 
+    ],
+#     "flirt": [
+#
+#     ],
 }
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(levelname)s | %(message)s",
 )
+
+def chunked(lst, size):
+    for i in range(0, len(lst), size):
+        yield lst[i:i + size]
 
 def slugify(text: str) -> str:
     """Creates a filesystem-safe, snake_case filename from a string."""
@@ -200,7 +172,7 @@ async def tts_request(
         "generation_id": str(generation_id)
     }
     try:
-        response = await client.post(TTS_API_URL, json=payload, timeout=45)
+        response = await client.post(TTS_API_URL, json=payload, timeout=3000)
         response.raise_for_status()
         return response.content
     except httpx.RequestError as e:
@@ -236,31 +208,27 @@ async def generate_and_save_clip(
     logging.info(f"  ✓ {dest.relative_to(CACHE_DIR)} (speed: {sentence_speed})")
 
 async def main() -> None:
-    """Main asynchronous routine."""
-    assert_counts(LINES, want=5)
+    """Simple sequential voice line generation with unique filenames."""
     gen_id = uuid.uuid4()
     start = time.time()
 
     async with httpx.AsyncClient() as client:
-        tasks = []
         for tag, sentences in LINES.items():
             out_dir = CACHE_DIR / tag
             out_dir.mkdir(parents=True, exist_ok=True)
-            logging.info(f"[{tag}] Preparing {len(sentences)} clips to generate → {out_dir}")
+            logging.info(f"[{tag}] Total lines: {len(sentences)} → Output dir: {out_dir}")
 
-            for i, (sentence_text, sentence_speed) in enumerate(sentences):
-                task = generate_and_save_clip(
+            for index, (sentence_text, sentence_speed) in enumerate(sentences):
+                logging.info(f"  Generating [{index + 1}/{len(sentences)}]: {sentence_text}")
+                await generate_and_save_clip(
                     client,
                     sentence_text,
                     sentence_speed,
                     out_dir,
                     gen_id,
-                    index=i
+                    index=index
                 )
-                tasks.append(task)
-
-        logging.info(f"\nSending {len(tasks)} parallel requests to the TTS API...")
-        await asyncio.gather(*tasks)
+                await asyncio.sleep(0.25)  # Optional throttle
 
     logging.info("\nAll done. Total time: %.1fs" % (time.time() - start))
 

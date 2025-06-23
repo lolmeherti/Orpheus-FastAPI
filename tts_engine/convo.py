@@ -24,8 +24,8 @@ from pydub import AudioSegment
 # --- Custom Library Imports ---
 from streaming_chunker import StreamingChunker
 from audio_processing import preprocess_clip
-# from prosody_fast import get_f0 # Not explicitly used in the provided snippet, can be kept if used elsewhere
 from filler_queue_builder import FillerQueueBuilder
+from llm_classifier import LLMStyleClassifier
 
 os.environ["NEMO_DISABLE_TQDM"] = "1"
 
@@ -44,7 +44,7 @@ ECHO_SIMILARITY_THRESHOLD = 0.7
 LM_STUDIO_CHAT_URL = "http://127.0.0.1:1234/v1/chat/completions"
 ORPHEUS_API_URL = "http://127.0.0.1:5005/v1/audio/speech"
 VOICE = "tara"
-MIN_WORDS_FOR_CHUNK = 8 # Critical for how quickly first audio is generated
+MIN_WORDS_FOR_CHUNK = 8
 TOKEN_SOFT_LIMIT = 2500
 TOKEN_HARD_LIMIT = 7700
 KEEP_RECENT = 2
@@ -61,40 +61,44 @@ filler_builder = FillerQueueBuilder(
 )
 
 SUMMARY_BOT_TEMPLATE = ROOT_DIR / "personas/chat_summary_bot.txt"
+MOOD_CLASSIFIER_BOT = ROOT_DIR / "personas/mood_classifier_bot.txt"
 PERSONA_PROMPT_TEMPLATE = ROOT_DIR / "personas/tts_default.txt"
 
 OUTPUT_DIR.mkdir(exist_ok=True)
-CLEANUP_FOLDERS = [OUTPUT_DIR, ROOT_DIR / "outputs"] # Ensure ROOT_DIR / "outputs" is intended if different from SCRIPT_DIR / "outputs"
-TTS_REQUEST_TIMEOUT = (10, 30) # (connect_timeout, read_timeout)
+CLEANUP_FOLDERS = [OUTPUT_DIR, ROOT_DIR / "outputs"]
+TTS_REQUEST_TIMEOUT = (10, 30)
 
 # ==============================================================================
 # == CENTRALIZED AUDIO CONFIGURATION ==
 # ==============================================================================
-REF_AUDIO_CLIP_PATH = CACHE_DIR / "alright_i_hear_you_pending_cache.wav" # Ensure this file exists if prosody features are used
+REF_AUDIO_CLIP_PATH = CACHE_DIR / "alright_i_hear_you_pending_cache.wav"
 CROSSFADE_MS = 80
-CHUNK_MS = 20 # For PyAudio stream buffer size
+CHUNK_MS = 20
 SILENCE_THRES_DB = -50
 FADE_IN_MS = 100
 TARGET_LUFS = -27.2
 SAFE_PAUSE_MS = 250
 EDGE_FADE_MS = 5
-REFERENCE_F0 = 0.0 # Pitch correction disabled by default
+REFERENCE_F0 = 0.0
 
 # --- Global State ---
 audio_q, prefetch_q, user_q, memory_q = (queue.Queue() for _ in range(4))
 interruption_requested, tts_actively_playing, program_is_shutting_down = threading.Event(), threading.Event(), threading.Event()
 INTERRUPT_KEYWORDS = {"stop", "shut up", "hold on", "wait", "enough", "nevermind", "cancel"}
-last_tts_text = "" # Stores the text of the last played TTS segment for echo detection
-current_generation_id = None # UUID for the current conversational turn
+
+last_tts_text = ""
+current_generation_id = None
 
 # --- Logging Configuration ---
 logging.basicConfig(
-    level=logging.INFO, # Change to logging.DEBUG for more verbose output if needed
+    level=logging.INFO,
     format='%(asctime)s.%(msecs)03d %(levelname)-7s [%(threadName)-15s] %(message)s',
     datefmt='%H:%M:%S'
 )
 
 logging.getLogger("http.client").setLevel(logging.WARNING)
+
+llm_classifier_instance = None
 
 # --- Helper Functions ---
 def strip_action_and_emoji(text: str) -> str:
@@ -105,7 +109,7 @@ def strip_action_and_emoji(text: str) -> str:
     return " ".join(text.split()) # Normalize whitespace
 
 def rough_tokens(txt: str) -> int:
-    return max(1, len(txt) // 4) # Rough estimate, can be refined
+    return max(1, len(txt) // 4)
 
 # --- Worker Threads ---
 
@@ -167,8 +171,7 @@ def asr_listener():
                                 segments, info = asr_model.transcribe(
                                     full_audio_np,
                                     language="en",
-                                    beam_size=1 # Faster, less accurate
-                                    # beam_size=5 # Default, more accurate
+                                    beam_size=1
                                 )
                                 # trans_duration = time.monotonic() - trans_start_time
                                 txt = " ".join(segment.text for segment in segments).strip()
@@ -202,7 +205,7 @@ def asr_listener():
                                         user_q.put((txt, effective_audio_duration_s))
                                     elif is_echo:
                                         logging.info(f"ASR_ECHO_SUPPRESSED: Echo detected and suppressed: '{txt}'")
-                                    elif txt: # Not an echo, but too few words
+                                    elif txt:
                                         logging.info(f"ASR_TOO_SHORT: Transcription too short, discarded: '{txt}'")
                             silence_counter = 0
                     else:
@@ -232,7 +235,7 @@ def kb_listener():
                 if tts_actively_playing.is_set() and line.lower() in INTERRUPT_KEYWORDS:
                     logging.info("KB_INTERRUPT: Keyboard interrupt keyword detected during TTS.")
                     interruption_requested.set()
-                user_q.put((line, 0.0)) # 0.0 for duration as it's text input
+                user_q.put((line, 0.0))
         except (EOFError, KeyboardInterrupt):
             logging.info("KB_LISTENER_EOF_OR_INTERRUPT: Shutting down keyboard listener.")
             break
@@ -243,12 +246,12 @@ def kb_listener():
 
 
 def audio_player_thread():
-    global last_tts_text # Ensure global is used if modified
+    global last_tts_text
     pa = pyaudio.PyAudio()
     stream = None
     active_gen_id = None
     current_stream_rate = None
-    prev_tail = np.array([], dtype=np.int16) # For crossfading
+    prev_tail = np.array([], dtype=np.int16)
 
     def open_stream(rate):
         nonlocal stream, current_stream_rate
@@ -265,7 +268,6 @@ def audio_player_thread():
         if not stream or current_stream_rate != sample_rate:
             stream = open_stream(sample_rate)
 
-        # Crossfade logic
         fade_len_samples = int(sample_rate * CROSSFADE_MS / 1000)
         actual_fade_len = min(len(prev_tail), len(data_samples), fade_len_samples)
 
@@ -285,7 +287,6 @@ def audio_player_thread():
         # logging.debug(f"AUDIO_PLAYER_WRITE_STREAM: Writing {len(data_to_play)} samples to PyAudio stream.")
         stream.write(data_to_play.tobytes())
 
-        # Update prev_tail for next crossfade
         if len(data_samples) >= fade_len_samples:
             prev_tail = data_samples[-fade_len_samples:]
         else:
@@ -297,7 +298,7 @@ def audio_player_thread():
             gen_id, data_item, text_item = audio_q.get(timeout=1.0) # Adjusted for clarity
             # logging.debug(f"AUDIO_PLAYER_Q_GET: Received from audio_q. Text: '{str(text_item)[:50]}...', GenID: {gen_id}")
 
-            if data_item is None: # Shutdown signal
+            if data_item is None:
                 logging.info("AUDIO_PLAYER_SHUTDOWN_SIGNAL: Received None, shutting down.")
                 break
 
@@ -311,49 +312,44 @@ def audio_player_thread():
                 audio_q.task_done()
                 continue
 
-            audio_path_obj = data_item # data_item is Path object for audio files
+            audio_path_obj = data_item
 
             try:
-                if gen_id != active_gen_id: # New conversation turn started
+                if gen_id != active_gen_id:
                     # logging.debug(f"AUDIO_PLAYER_NEW_GEN_ID: New generation ID {gen_id}. Resetting active_gen_id and prev_tail.")
                     active_gen_id = gen_id
                     prev_tail = np.array([], dtype=np.int16) # Reset crossfade tail for new response
 
                 if interruption_requested.is_set():
                     # logging.info(f"AUDIO_PLAYER_INTERRUPT_SKIP: Skipping playback of '{str(text_item)[:50]}' due to interruption.")
-                    audio_q.task_done() # Still need to mark as done
-                    continue # Do not play this item
+                    audio_q.task_done()
+                    continue
 
-                # If we reach here, no interruption for this specific item yet
-                tts_actively_playing.set() # Set before loading/playing
+                tts_actively_playing.set()
                 is_filler = text_item == "[FILLER]"
 
                 log_text_display = audio_path_obj.name if is_filler else text_item
                 if is_filler:
                     logging.info(f"AUDIO_PLAYER_PLAY_FILLER: Playing filler: {log_text_display}")
-                    print(f"⏳ Filler: {audio_path_obj.name}") # Keep for UI
+                    print(f"⏳ Filler: {audio_path_obj.name}")
                 else:
                     logging.info(f"AUDIO_PLAYER_PLAY_TTS: Playing TTS: '{log_text_display[:60]}...' ({audio_path_obj.name})")
-                    print(f"🎵 TTS: '{text_item}'") # Keep for UI
-                    last_tts_text = text_item # Update for echo detection
+                    print(f"🎵 TTS: '{text_item}'")
+                    last_tts_text = text_item
 
-                # Load and play the current audio chunk
-                # load_start_time = time.monotonic()
                 current_audio_samples, current_sr = sf.read(str(audio_path_obj), dtype='int16')
                 # load_duration = (time.monotonic() - load_start_time) * 1000
                 # logging.debug(f"AUDIO_PLAYER_SF_READ: Loaded {audio_path_obj.name} in {load_duration:.0f}ms, SR: {current_sr}")
                 play_audio_data(current_audio_samples, current_sr)
 
-                # Attempt to play subsequent chunks of the same generation_id immediately (chaining)
                 while not interruption_requested.is_set():
                     try:
                         next_gen_id, next_data_item, next_text_item = audio_q.get(timeout=0.05) # Short timeout to check queue
                         if next_gen_id != active_gen_id: # Belongs to a newer generation/interruption
                             # logging.debug("AUDIO_PLAYER_CHAIN_BREAK_NEW_GEN: Next item from different gen_id. Re-queuing.")
                             audio_q.put((next_gen_id, next_data_item, next_text_item)) # Put it back
-                            break # Exit inner loop, outer loop will re-evaluate
+                            break
 
-                        # If we are here, it's part of the same generation_id and no global interruption yet
                         if next_text_item == "[PAUSE]":
                             pause_duration_ms = next_data_item
                             if not interruption_requested.is_set(): # Re-check before actual sleep
@@ -362,7 +358,7 @@ def audio_player_thread():
                             # else:
                                 # logging.info(f"AUDIO_PLAYER_CHAIN_PAUSE_SKIPPED: Pause skipped due to interruption.")
                             audio_q.task_done()
-                            continue # Check for more items in this generation
+                            continue
 
                         next_audio_path = next_data_item
                         is_next_filler = next_text_item == "[FILLER]"
@@ -376,15 +372,12 @@ def audio_player_thread():
                             print(f"🎵 TTS: '{next_text_item}'") # Keep for UI
                             last_tts_text = next_text_item
 
-                        # load_start_time_next = time.monotonic()
                         next_samples, next_sr = sf.read(str(next_audio_path), dtype='int16')
-                        # load_duration_next = (time.monotonic() - load_start_time_next) * 1000
                         # logging.debug(f"AUDIO_PLAYER_CHAIN_SF_READ: Loaded {next_audio_path.name} in {load_duration_next:.0f}ms, SR: {next_sr}")
 
                         play_audio_data(next_samples, next_sr)
                         current_sr = next_sr # Update current sample rate if it changed
 
-                        # Delete non-cache files after playing
                         if next_audio_path.exists() and not (CACHE_DIR.resolve() in next_audio_path.resolve().parents):
                             try:
                                 # logging.debug(f"AUDIO_PLAYER_DELETE_OUTPUT: Deleting played output file: {next_audio_path}")
@@ -394,11 +387,9 @@ def audio_player_thread():
                         audio_q.task_done()
                     except queue.Empty:
                         # logging.debug("AUDIO_PLAYER_CHAIN_EMPTY: No more chained items for this generation_id currently.")
-                        break # No more items for this generation_id currently
+                        break
             finally:
-                # This task_done is for the initial item fetched by the outer try's audio_q.get()
                 audio_q.task_done()
-                # Clean up the initial file if it's not a cached one
                 if audio_path_obj.exists() and not (CACHE_DIR.resolve() in audio_path_obj.resolve().parents):
                     try:
                         # logging.debug(f"AUDIO_PLAYER_DELETE_OUTPUT: Deleting played output file (initial): {audio_path_obj}")
@@ -407,7 +398,7 @@ def audio_player_thread():
                         logging.warning(f"AUDIO_PLAYER_DELETE_FAIL: Could not delete {audio_path_obj}: {e_del}")
 
 
-        except queue.Empty: # Outer queue.Empty, means no new audio items for a while
+        except queue.Empty:
             if tts_actively_playing.is_set():
                 # logging.debug("AUDIO_PLAYER_Q_EMPTY_CLEAR_STATE: Queue empty, TTS was active. Clearing state.")
                 active_gen_id = None # Reset so next item starts fresh
@@ -416,7 +407,6 @@ def audio_player_thread():
                 prev_tail = np.array([], dtype=np.int16) # Clear crossfade tail
         except Exception as e:
             logging.error(f"AUDIO_PLAYER_ERROR: {e}\n{traceback.format_exc()}", exc_info=True)
-            # Potentially reset state or attempt to recover
             if stream:
                 try: stream.stop_stream(); stream.close()
                 except: pass
@@ -466,7 +456,7 @@ def tts_requester_thread(text_chunk, generation_id):
             return
 
         preprocess_duration_ms = (time.monotonic() - preprocess_start_time) * 1000
-        logging.info(f"TTS_REQUESTER_PREPROCESSED: Finished preprocessing ({preprocess_duration_ms:.0f}ms). Queuing audio '{raw_audio_path.name}' for: '{text_chunk[:50]}...'")
+#         logging.info(f"TTS_REQUESTER_PREPROCESSED: Finished preprocessing ({preprocess_duration_ms:.0f}ms). Queuing audio '{raw_audio_path.name}' for: '{text_chunk[:50]}...'")
 
         audio_q.put((generation_id, raw_audio_path, text_chunk))
     except Exception as e:
@@ -505,7 +495,7 @@ def prefetch_worker():
                 thread.start()
 
             for thread in fetch_threads:
-                thread.join() # Wait for all TTS requests for this batch to complete
+                thread.join()
             prefetch_q.task_done()
         except queue.Empty:
             continue
@@ -515,7 +505,7 @@ def prefetch_worker():
 
 
 def tts_request(txt, generation_id):
-    if not txt.strip(): # Check if string is empty or only whitespace
+    if not txt.strip():
         logging.warning(f"TTS_API_SKIP_EMPTY: Skipping TTS request for empty text. GenID: {generation_id}")
         return None
     if current_generation_id and generation_id != current_generation_id:
@@ -530,14 +520,13 @@ def tts_request(txt, generation_id):
         api_call_duration_ms = (time.monotonic() - api_call_start_time) * 1000
         logging.info(f"TTS_API_RECEIVE: Orpheus response status {response.status_code} ({api_call_duration_ms:.0f}ms) for: '{txt[:50]}...'")
 
-        response.raise_for_status() # Raises HTTPError for bad responses (4XX or 5XX)
+        response.raise_for_status()
         wav_data = response.content
 
-        if len(wav_data) < 1000: # Basic check for valid WAV data
+        if len(wav_data) < 1000:
             logging.warning(f"TTS_API_INVALID_DATA: Orpheus returned insufficient data (len: {len(wav_data)}) for: '{txt[:50]}...'")
             return None
 
-        # Use more unique filename including microseconds
         file_name = f"{datetime.utcnow().strftime('%Y%m%d_%H%M%S%f')}_{generation_id.hex[:6]}_{uuid.uuid4().hex[:4]}.wav"
         output_path = OUTPUT_DIR / file_name
         output_path.write_bytes(wav_data)
@@ -549,7 +538,7 @@ def tts_request(txt, generation_id):
     except requests.exceptions.RequestException as e:
         logging.error(f"TTS_API_ERROR: Orpheus request failed for '{txt[:50]}...': {e}")
         return None
-    except Exception as e_unexp: # Catch any other unexpected errors
+    except Exception as e_unexp:
         logging.error(f"TTS_API_UNEXPECTED_ERROR: Unexpected error during TTS request for '{txt[:50]}...': {e_unexp}", exc_info=True)
         return None
 
@@ -564,15 +553,9 @@ def cleanup_old_audio():
         # logging.debug(f"CLEANUP_AUDIO_SCAN_FOLDER: Scanning folder: {folder_to_clean}")
         for f_path in folder_to_clean.glob("*.wav"):
             try:
-                # Resolve paths to ensure proper comparison if symlinks are involved
                 resolved_f_path = f_path.resolve()
-                # Check if the file is within any of the CACHE_DIR subdirectories
                 is_in_cache = False
                 if CACHE_DIR.is_dir(): # Check if CACHE_DIR itself exists
-                    # This check `CACHE_DIR.resolve() in resolved_f_path.parents` means
-                    # f_path must be a child of CACHE_DIR.
-                    # If CACHE_DIR itself can contain files to keep, this needs adjustment.
-                    # Assuming cached files are *inside* subdirs of CACHE_DIR or CACHE_DIR itself
                     if CACHE_DIR.resolve() == resolved_f_path.parent or CACHE_DIR.resolve() in resolved_f_path.parents:
                          is_in_cache = True
 
@@ -588,9 +571,9 @@ def cleanup_old_audio():
     logging.info(f"CLEANUP_AUDIO_DONE: Finished cleanup. Deleted {cleaned_count} file(s).")
 
 
-def hermes_chat(msgs): # Modified for httpx Client
+def hermes_chat(msgs):
     try:
-        request_time_outer = time.monotonic() # Time before client instantiation and call
+        request_time_outer = time.monotonic()
         buffer = ""
         first_token_received = False
         timeout_config = httpx.Timeout(10.0, read=60.0)
@@ -599,7 +582,7 @@ def hermes_chat(msgs): # Modified for httpx Client
             request_time_inner = time.monotonic() # Time just before client.stream()
             with client.stream("POST",
                                LM_STUDIO_CHAT_URL,
-                               json={"model": "hermes", "messages": msgs, "temperature": 0.9, "stream": True}
+                               json={"model": "grok-3-reasoning-gemma3-12b-distilled", "messages": msgs, "temperature": 0.6, "stream": True}
                                ) as r:
 
                 time_before_raise_status = time.monotonic()
@@ -611,9 +594,7 @@ def hermes_chat(msgs): # Modified for httpx Client
 
                 for chunk in r.iter_text():
                     if not first_token_received and chunk.strip():
-                        # This TTFT is now relative to when headers were confirmed OK
                         ttft_from_headers_ok = (time.monotonic() - time_after_raise_status) * 1000
-                        # Overall TTFT from the very start of the hermes_chat function call (outer)
                         ttft_overall = (time.monotonic() - request_time_outer) * 1000
 
                         logging.info(f"LLM_STREAM_TTFT (httpx.Client): First token data received. Overall TTFT: {ttft_overall:.0f}ms. From Headers OK: {ttft_from_headers_ok:.0f}ms. Chunk: '{chunk.strip()[:60]}'")
@@ -624,7 +605,6 @@ def hermes_chat(msgs): # Modified for httpx Client
                         break
 
                     buffer += chunk
-                    # ... (rest of SSE processing) ...
                     while 'data: ' in buffer and '\n' in buffer:
                         event_start = buffer.find('data: ')
                         line_end = buffer.find('\n', event_start)
@@ -639,7 +619,6 @@ def hermes_chat(msgs): # Modified for httpx Client
                                 if 'content' in delta and delta['content'] is not None:
                                     yield delta['content']
                         except (json.JSONDecodeError, IndexError, KeyError): pass
-    # ... (rest of exception handling) ...
     except httpx.RequestError as e_req:
         if not program_is_shutting_down.is_set():
             logging.error(f"LLM_STREAM_REQUEST_ERROR (httpx.Client): LLM request failed: {e_req}", exc_info=True)
@@ -655,7 +634,6 @@ def summarise(prev_summary, new_transcript):
     logging.info(f"SUMMARY_START: Summarizing transcript. Prev summary len: {len(prev_summary or '')}, New transcript len: {len(new_transcript)}")
     try:
         content = f"PREVIOUS SUMMARY:\n{prev_summary or 'None.'}\n\nNEW TRANSCRIPT TO ADD:\n{new_transcript}"
-        # Ensure SUMMARY_PROMPT is loaded and available
         if not SUMMARY_PROMPT:
             logging.error("SUMMARY_FAIL_NO_PROMPT: SUMMARY_PROMPT is not loaded.")
             return prev_summary or "[summary failed: no prompt]"
@@ -677,7 +655,7 @@ def play_startup_greeting_thread(audio_path_obj):
         logging.info(f"GREETING_PLAY_START: Playing startup greeting: {audio_path_obj.name}")
         data_audio, sr_audio = sf.read(audio_path_obj, dtype='float32') # float32 for sd.play
         sd.play(data_audio, sr_audio)
-        sd.wait() # Wait for playback to finish
+        sd.wait()
         logging.info(f"GREETING_PLAY_DONE: Finished playing startup greeting: {audio_path_obj.name}")
     except Exception as e:
         logging.warning(f"GREETING_PLAY_ERROR: Error playing greeting '{audio_path_obj.name}': {e}", exc_info=True)
@@ -696,7 +674,7 @@ def warmup_tts():
         logging.warning(f"TTS_WARMUP_FAIL: Orpheus TTS warmup request failed: {e}")
 
 def main():
-    global current_generation_id, REFERENCE_F0, PERSONA_TEMPLATE, SUMMARY_PROMPT # Ensure globals are intended
+    global current_generation_id, REFERENCE_F0, PERSONA_TEMPLATE, SUMMARY_PROMPT,llm_classifier_instance # Ensure globals are intended
 
     # Logging config is now at the top
     logging.info("MAIN_INIT: Application starting...")
@@ -711,7 +689,19 @@ def main():
     if not SUMMARY_PROMPT:
         logging.critical("MAIN_FATAL_NO_SUMMARY_PROMPT: SUMMARY_PROMPT is not loaded. Exiting.")
         sys.exit(1)
-    chat_history[0]["content"] = PERSONA_TEMPLATE # Set initial system prompt
+    chat_history[0]["content"] = PERSONA_TEMPLATE
+    if not MOOD_CLASSIFIER_BOT.exists():
+        logging.critical(f"MAIN_FATAL_NO_MOOD_PROMPT: MOOD_CLASSIFIER_BOT file not found at {MOOD_CLASSIFIER_BOT}. Mood classification will be disabled. Exiting.")
+        sys.exit(1)
+
+    # --- Initialize LLM Style Classifier ---
+    try:
+        logging.info("MAIN_INIT_CLASSIFIER: Initializing LLMStyleClassifier...")
+        llm_classifier_instance = LLMStyleClassifier(system_prompt_path=MOOD_CLASSIFIER_BOT)
+        logging.info("MAIN_INIT_CLASSIFIER_DONE: LLMStyleClassifier initialized successfully.")
+    except Exception as e:
+        logging.critical(f"MAIN_FATAL_CLASSIFIER_INIT: Failed to initialize LLMStyleClassifier even though prompt file exists: {e}. Exiting.", exc_info=True)
+        sys.exit(1)
 
     if CACHE_DIR.is_dir():
         interrupt_audio_files = list(CACHE_DIR.glob("*_interrupt_cache.wav"))
@@ -775,11 +765,30 @@ def main():
                 user_q.task_done()
             except queue.Empty:
                 if program_is_shutting_down.is_set(): break
-                continue # No user input, loop back
+                continue
 
             turn_start_time = time.monotonic()
             logging.info(f"MAIN_TURN_START: Processing user input: '{current_user_input[:100]}...'")
 
+            resolved_tag = "neutral" # Default if classification fails or is skipped
+            mood_info = {"tag": "neutral", "score": 0.0, "source": "default_fallback"} # Provide a default mood_info
+
+            if llm_classifier_instance: # Check if LLMStyleClassifier was initialized
+                try:
+                    mood_info = llm_classifier_instance.get_classification(current_user_input)
+                    resolved_tag = mood_info["tag"]
+
+                    if mood_info["source"] != "llm_classifier": # Check if classification was fully successful
+                        logging.warning(f"LLM classification issue: tag='{mood_info['tag']}', source='{mood_info['source']}'. Defaulting resolved_tag to 'neutral'.")
+                        resolved_tag = "neutral"
+
+                    logging.info(
+                        f"MOOD_CLASSIFIED_LLM: tag='{mood_info['tag']}' (score={mood_info['score']:.1f}, source='{mood_info['source']}') → resolved_tag: '{resolved_tag}' for: '{current_user_input}'"
+                    )
+                except Exception as e:
+                    logging.warning(f"MOOD_CLASSIFIER_ERROR (LLM Call): Uncaught exception during get_classification: {e}", exc_info=True)
+            else:
+                logging.warning("MOOD_CLASSIFICATION_SKIPPED: LLMStyleClassifier not initialized.")
 
             if interruption_requested.is_set():
                 logging.info("MAIN_INTERRUPT_HANDLING_START: Interruption was requested. Clearing queues and playing sound.")
@@ -822,12 +831,12 @@ def main():
             # Queue fillers immediately
             # logging.debug(f"MAIN_FILLER_QUEUE_START: Queuing fillers for gen_id {current_generation_id.hex[:8]}")
             fillers_queued_count = 0
-            for item in filler_builder.build_queue_items(): # This should be quick
-                if isinstance(item, Path): # It's an audio file path
-                    audio_q.put((current_generation_id, item, "[FILLER]"))
-                    fillers_queued_count +=1
-                elif isinstance(item, int): # It's a pause duration in ms
-                    audio_q.put((current_generation_id, item, "[PAUSE]"))
+#             for item in filler_builder.build_queue_items(): # This should be quick
+#                 if isinstance(item, Path): # It's an audio file path
+#                     audio_q.put((current_generation_id, item, "[FILLER]"))
+#                     fillers_queued_count +=1
+#                 elif isinstance(item, int): # It's a pause duration in ms
+#                     audio_q.put((current_generation_id, item, "[PAUSE]"))
                     # fillers_queued_count +=1 # Or count pauses differently
             # logging.info(f"MAIN_FILLER_QUEUE_DONE: Queued {fillers_queued_count} filler/pause items.")
 
@@ -939,12 +948,12 @@ def main():
 
             # Hard token limit enforcement (less likely if soft limit summarization works)
             while sum(rough_tokens(m['content']) for m in chat_history) > TOKEN_HARD_LIMIT:
-                if len(chat_history) > 2: # Keep system prompt and at least one exchange
+                if len(chat_history) > 2:
                     logging.warning(f"MAIN_HISTORY_HARD_LIMIT_TRIM: Hard token limit exceeded. Removing oldest message after system prompt.")
-                    del chat_history[1] # Remove the oldest message after system prompt
+                    del chat_history[1]
                 else:
                     logging.warning("MAIN_HISTORY_HARD_LIMIT_UNABLE_TO_TRIM: Hard token limit hit, but history too short to trim further.")
-                    break # Avoid infinite loop if something is wrong
+                    break
 
             turn_duration_ms = (time.monotonic() - turn_start_time) * 1000
             logging.info(f"MAIN_TURN_END: Finished processing turn. Duration: {turn_duration_ms:.0f}ms.")
@@ -960,16 +969,15 @@ def main():
         logging.info("MAIN_FINALIZING: Initiating shutdown sequence for all threads...")
         program_is_shutting_down.set() # Signal all threads to shut down
 
-        # Send sentinel values to queues to unblock worker threads
         # logging.debug("MAIN_FINALIZING_SENTINELS: Sending shutdown sentinels to queues.")
         audio_q.put((None, None, None))
-        prefetch_q.put((None, None)) # Prefetch worker expects (generation_id, chunks_to_prefetch)
-        memory_q.put((None, None)) # Memory worker expects (prev_mems, transcript_to_add)
+        prefetch_q.put((None, None))
+        memory_q.put((None, None))
         # user_q is typically emptied by main loop, or input() in kb_listener will break
 
         for t in threads:
             # logging.debug(f"MAIN_FINALIZING_JOIN_THREAD: Joining thread {t.name}...")
-            t.join(timeout=2.0) # Wait for threads to finish
+            t.join(timeout=2.0)
             if t.is_alive():
                 logging.warning(f"MAIN_FINALIZING_THREAD_ALIVE: Thread {t.name} did not shut down cleanly.")
 
@@ -983,7 +991,6 @@ if __name__ == "__main__":
     PERSONA_TEMPLATE = ""
     SUMMARY_PROMPT = ""
     try:
-        # Load persona and summary prompts
         with open(PERSONA_PROMPT_TEMPLATE, "r", encoding="utf-8") as f:
             PERSONA_TEMPLATE = f.read()
         with open(SUMMARY_BOT_TEMPLATE, "r", encoding="utf-8") as f:

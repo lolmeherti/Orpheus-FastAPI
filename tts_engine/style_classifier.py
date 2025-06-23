@@ -1,80 +1,125 @@
-# mood_classifier.py
+# style_classifier.py
 
+import re
 from sentence_transformers import SentenceTransformer, util
 import numpy as np
-from style_benchmark import anchor_texts, anchor_labels, MANUAL_OVERRIDES
-import re
-
-print("[MoodClassifier] Loading model and anchors...")
-model = SentenceTransformer("all-MiniLM-L6-v2")
-anchor_embeddings = model.encode(anchor_texts, normalize_embeddings=True)
-print("[MoodClassifier] Ready.")
+# Import the NON_EMERGENCY_ANCHORS which are now crucial
+from master_anchors import NON_EMERGENCY_ANCHORS
 
 # ==============================================================================
-# == MOOD DETECTION CONFIGURATION ==
+# == The Definitive Hybrid Cascade Model ==
 # ==============================================================================
-STYLE_FALLBACK_MAP = {
-    "flirt": ["banter", "intimate", "neutral"],
-    "banter": ["intimate", "neutral"],
-    "intimate": ["neutral"],
-    "grief": ["intimate", "neutral"],
-    "emergency": ["calm", "neutral"],
-    "philosophical": ["ponder", "neutral"],
-    "affirming": ["neutral"],
-    "neutral": [],
-}
 
-TAG_SCORE_MINIMUMS = {
-    "flirt": 0.38,
-    "intimate": 0.40,
-    "banter": 0.35,
-    "grief": 0.30,
-    "emergency": 0.30,
-    "critical": 0.35,
-}
+class Classifier:
+    """A generic sentence classifier engine."""
+    def __init__(self, model: SentenceTransformer, anchor_config: dict):
+        self.model = model
+        self.anchors, self.labels = self._prepare_anchors(anchor_config)
+        if self.anchors:
+            self.embeddings = self._encode(self.anchors)
+        else:
+            self.embeddings = np.array([])
 
-HIGH_CONFIDENCE = 0.50
-MID_CONFIDENCE  = 0.38
-LOW_CONFIDENCE  = 0.30
+    def _encode(self, texts: list[str]) -> np.ndarray:
+        return self.model.encode(texts, normalize_embeddings=True)
 
-def classify(text: str, verbose: bool = False) -> dict | str:
+    def _prepare_anchors(self, config: dict) -> tuple[list[str], list[str]]:
+        texts, labels = [], []
+        for label, text_list in config.items():
+            for text in text_list:
+                texts.append(text.strip())
+                labels.append(label)
+        return texts, labels
+
+    def classify(self, text: str) -> dict:
+        if self.embeddings.size == 0:
+            return {"tag": "unknown", "score": 0.0}
+        input_embedding = self._encode([text.strip()])
+        scores = util.dot_score(input_embedding, self.embeddings)[0].cpu().numpy()
+        best_idx = int(np.argmax(scores))
+        return {"tag": self.labels[best_idx], "score": float(scores[best_idx])}
+
+
+class VetoSystem:
     """
-    Classify the emotional mood of the input string.
-
-    Args:
-        text (str): The input sentence to classify.
-        verbose (bool): If True, returns tag + source + score. If False, returns tag only.
-
-    Returns:
-        str or dict: Either just the tag or full result depending on `verbose`.
+    Implements the definitive Hybrid Cascade model: An emergency veto followed by
+    a two-step gate and specialist classification, built with the correct tag definitions.
     """
-    clean_text = text.strip().lower()
+    def __init__(self, master_anchor_config: dict, overrides_config: dict):
+        print("[VetoSystem] Initializing Definitive Hybrid Cascade...")
+        model = SentenceTransformer("all-MiniLM-L6-v2")
+        self.overrides = {self._normalize(k): v for k, v in overrides_config.items()}
 
-    def normalize(s):
-        return re.sub(r"[^a-zA-Z0-9]+", " ", s).strip()
+        # --- Define the Ground Truth for Social Tags ---
+        social_keys = {"banter", "flirt", "intimate"}
 
-    normalized_input = normalize(clean_text)
+        # --- Classifier 0: The Emergency Veto (MUST RUN FIRST) ---
+        print("  - Building Emergency Veto classifier (Step 0)...")
+        # THIS IS THE KEY ARCHITECTURAL FIX: Use negative examples.
+        emergency_veto_config = {
+            "emergency": master_anchor_config.get("emergency", []),
+            "not_emergency": NON_EMERGENCY_ANCHORS
+        }
+        self.emergency_checker = Classifier(model, emergency_veto_config)
 
-    for phrase, tag in MANUAL_OVERRIDES.items():
-        if normalize(phrase) == normalized_input:
-            return {"tag": tag, "score": 1.0, "source": "override"} if verbose else tag
+        # --- Classifier 1: The Main Gate (built with correct social definition) ---
+        print("  - Building Main Gate classifier (Step 1)...")
+        main_gate_config = self._build_main_gate_config(master_anchor_config, social_keys)
+        self.main_gate_classifier = Classifier(model, main_gate_config)
 
-    embedding = model.encode([clean_text], normalize_embeddings=True)
-    scores = util.dot_score(embedding, anchor_embeddings)[0].cpu().numpy()
-    best_idx = int(np.argmax(scores))
-    tag = anchor_labels[best_idx]
-    return {"tag": tag, "score": float(scores[best_idx]), "source": "model"} if verbose else tag
+        # --- Classifier 2: The Social Specialist ---
+        print("  - Building Social Specialist classifier (Step 2)...")
+        social_specialist_config = {key: master_anchor_config.get(key, []) for key in social_keys}
+        self.social_specialist_classifier = Classifier(model, social_specialist_config)
 
-def resolve_fallback(tag: str, score: float) -> str:
-    tag_min = TAG_SCORE_MINIMUMS.get(tag, LOW_CONFIDENCE)
-    if score < tag_min:
-        return "neutral"
+        # --- System Configuration ---
+        self.EMERGENCY_VETO_THRESHOLD = 0.65
+        self.SOCIAL_GATE_THRESHOLD = 0.35
+        print(f"  - Emergency Veto Threshold set to: {self.EMERGENCY_VETO_THRESHOLD}")
+        print(f"  - Social Gate Threshold set to: {self.SOCIAL_GATE_THRESHOLD}")
+        print("[VetoSystem] Ready.")
 
-    fallback_chain = STYLE_FALLBACK_MAP.get(tag, [])
-    if score >= HIGH_CONFIDENCE:
-        return tag
-    elif score >= MID_CONFIDENCE:
-        return tag
-    elif fallback_chain:
-        return fallback_chain[0]
-    return "neutral"
+    def _build_main_gate_config(self, master_config: dict, social_keys: set) -> dict:
+        """Dynamically builds the configuration for the Step 1 classifier."""
+        config = {}
+        social_anchors = []
+
+        for key, anchors in master_config.items():
+            if key in social_keys:
+                social_anchors.extend(anchors)
+            else: # Includes 'emergency', 'critical', 'grief', 'affirming', etc.
+                config[key] = anchors
+
+        config["social"] = social_anchors
+        return config
+
+    @staticmethod
+    def _normalize(s: str) -> str:
+        return re.sub(r"[^a-zA-Z0-9]+", "", s).strip().lower()
+
+    def get_classification(self, text: str) -> dict:
+        normalized_input = self._normalize(text)
+        if override_tag := self.overrides.get(normalized_input):
+            return {"tag": override_tag, "score": 1.0, "source": "override"}
+
+        # --- STEP 0: THE EMERGENCY VETO ---
+        emergency_result = self.emergency_checker.classify(text)
+        # The veto now only triggers if the TAG is 'emergency' AND the score is high.
+        if emergency_result['tag'] == 'emergency' and emergency_result['score'] >= self.EMERGENCY_VETO_THRESHOLD:
+            emergency_result['source'] = 'emergency_veto'
+            return emergency_result
+
+        # --- STEP 1: Classify against the Main Gate ---
+        gate_result = self.main_gate_classifier.classify(text)
+
+        # --- STEP 2: The Conditional Social Check ---
+        if gate_result['tag'] == 'social':
+            # If the gate says 'social', we ALWAYS consult the specialist.
+            specialist_result = self.social_specialist_classifier.classify(text)
+            specialist_result['source'] = 'social_specialist'
+            return specialist_result
+        else:
+            # The gate's result was NOT 'social' (e.g., it was affirming, critical, etc.)
+            # We return its finding directly.
+            gate_result['source'] = 'main_gate'
+            return gate_result
