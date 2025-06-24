@@ -147,7 +147,7 @@ def main():
             PERSONA_TEMPLATE = f.read()
         with open(config.SUMMARY_BOT_TEMPLATE, "r", encoding="utf-8") as f:
             SUMMARY_PROMPT = f.read()
-        llm_classifier_instance = LLMStyleClassifier(system_prompt_path=config.MOOD_CLASSIFIER_BOT)
+        llm_classifier_instance = None
     except Exception as e:
         logging.critical(f"MAIN_FATAL_INIT: {e}", exc_info=True)
         sys.exit(1)
