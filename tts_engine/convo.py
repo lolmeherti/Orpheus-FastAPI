@@ -36,6 +36,10 @@ current_generation_id = None
 pending_search = {"query": None, "original_input": None}
 CONFIRMATION_KEYWORDS = {"yes", "yep", "yeah", "that's right", "correct", "indeed", "go ahead", "do it", "sure"}
 
+HISTORY_KEYWORDS = {"what was my last search", "show my search history", "what were my recent searches", "list my searches", "list my search history", "what is my search history"}
+
+last_listed_history = []
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s.%(msecs)03d %(levelname)-7s [%(threadName)-15s] %(message)s', datefmt='%H:%M:%S')
 logging.getLogger("http.client").setLevel(logging.WARNING)
 llm_classifier_instance = None
@@ -81,6 +85,8 @@ def cleanup_old_audio():
 def hermes_chat(msgs):
     try:
         buffer = ""
+        is_in_think_block = False
+
         with httpx.stream("POST",
                          config.LM_STUDIO_CHAT_URL,
                          json={"model": "grok-3-reasoning-gemma3-12b-distilled", "messages": msgs, "temperature": 0.6, "stream": True},
@@ -89,21 +95,58 @@ def hermes_chat(msgs):
             for chunk in r.iter_text():
                 if interruption_requested.is_set() or program_is_shutting_down.is_set(): break
                 buffer += chunk
-                while 'data: ' in buffer and '\n' in buffer:
-                    event_start = buffer.find('data: ')
-                    line_end = buffer.find('\n', event_start)
-                    if line_end == -1: break
-                    line = buffer[event_start:line_end]
-                    buffer = buffer[line_end+1:]
-                    try:
-                        data_str = line.split('data: ', 1)[1].strip()
-                        if data_str == '[DONE]': return
-                        if data_str:
-                            delta = json.loads(data_str)['choices'][0]['delta']
-                            if 'content' in delta and delta['content'] is not None: yield delta['content']
-                    except (json.JSONDecodeError, IndexError, KeyError): pass
+
+                while True:
+                    if is_in_think_block:
+                        end_tag_pos = buffer.find('</think>')
+                        if end_tag_pos != -1:
+                            thought_process = buffer[:end_tag_pos]
+                            logging.info(f"LLM_THOUGHT: {thought_process.strip()}")
+                            buffer = buffer[end_tag_pos + len('</think>'):]
+                            is_in_think_block = False
+                        else:
+                            break
+
+                    start_tag_pos = buffer.find('<think>')
+                    if start_tag_pos != -1:
+                        pre_think_text = buffer[:start_tag_pos]
+                        if pre_think_text:
+                            for event in process_json_events(pre_think_text):
+                                yield event
+
+                        buffer = buffer[start_tag_pos + len('<think>'):]
+                        is_in_think_block = True
+                    else:
+                        if buffer:
+                            for event in process_json_events(buffer):
+                                yield event
+                            buffer = ""
+                        break
+
     except Exception as e:
         if not program_is_shutting_down.is_set(): logging.error(f"LLM_STREAM_ERROR: {e}", exc_info=True)
+
+def process_json_events(text_chunk):
+    """Helper generator to process the Server-Sent Events (SSE) JSON from the buffer."""
+    buffer = text_chunk
+    while 'data: ' in buffer and '\n' in buffer:
+        event_start = buffer.find('data: ')
+        line_end = buffer.find('\n', event_start)
+        if line_end == -1: break
+
+        line = buffer[event_start:line_end]
+        buffer = buffer[line_end+1:]
+
+        try:
+            data_str = line.split('data: ', 1)[1].strip()
+            if data_str == '[DONE]': return
+            if data_str:
+                delta = json.loads(data_str)['choices'][0]['delta']
+                if 'content' in delta and delta['content'] is not None:
+                    yield delta['content']
+        except (json.JSONDecodeError, IndexError, KeyError):
+            pass
+
 def summarise(prev_summary, new_transcript):
     try:
         content = f"PREVIOUS SUMMARY:\n{prev_summary or 'None.'}\n\nNEW TRANSCRIPT TO ADD:\n{new_transcript}"
@@ -242,50 +285,113 @@ def main():
             if pending_search["query"]:
                 user_response_lower = current_user_input.lower().strip().rstrip('.!')
                 if user_response_lower in CONFIRMATION_KEYWORDS:
-                    logging.info(f"MAIN_CONFIRMATION: User confirmed search. Executing.")
+                    logging.info("MAIN_CONFIRMATION: User confirmed search. Executing.")
                     messages_for_llm = web_tools.execute_search_and_summarize(
                         user_input=pending_search["original_input"],
                         search_query=pending_search["query"],
                         personas=personas
                     )
                     tool_was_used = True
-                    # We only save the user part of the history here
                     chat_history.append({"role": "user", "content": pending_search["original_input"]})
                 else:
-                    logging.info(f"MAIN_CONFIRMATION: User denied search. Cancelling.")
+                    logging.info("MAIN_CONFIRMATION: User denied search. Cancelling.")
                     messages_for_llm = [{"role": "system", "content": personas['default']}, {"role": "user", "content": "Acknowledge that you have cancelled the requested action and ask what they would like to do instead."}]
                     chat_history.append({"role": "user", "content": pending_search["original_input"]})
-                    # Since the search was denied, reset the state immediately
                     pending_search["query"] = None
                     pending_search["original_input"] = None
-
-            # STATE 2: If not waiting, did the user just ask to start a new search?
             else:
-                proposed_query = web_tools.check_for_search_keyword(current_user_input)
-                if proposed_query:
-                    # A keyword was found. Set the state and ask for confirmation.
+                user_input_lower = current_user_input.lower()
+                selection_match_by_num = re.search(r'\b(one|two|three|four|five|1|2|3|4|5)\b', user_input_lower)
+
+                if last_listed_history and selection_match_by_num:
+                    logging.info("MAIN_HISTORY_TOOL: User is selecting from a previous list by number.")
+                    num_map = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5}
+                    try:
+                        selected_indices = [num_map.get(n, int(n)) - 1 for n in re.findall(r'\b(one|two|three|four|five|1|2|3|4|5)\b', user_input_lower)]
+                        selected_searches = [last_listed_history[i] for i in selected_indices if 0 <= i < len(last_listed_history)]
+
+                        if not selected_searches:
+                            context = "The user referred to a number, but it wasn't a valid selection from the history I provided. Gently let them know and ask them to choose from the numbers listed."
+                        else:
+                            context = "The user has asked for more details on the following past searches. Please provide a helpful summary based on the information provided:\n\n"
+                            for search in selected_searches:
+                                context += f"--- Logged Search Data ---\n"
+                                context += f"Original Question they asked: '{search.get('original_question', 'N/A')}'\n"
+                                context += f"The query you executed was: '{search.get('executed_query', 'N/A')}'\n"
+                                context += f"The summary you gave them last time was: '{search.get('summary_answer', 'N/A')}'\n\n"
+                            context += "Based on this, please provide a fresh, helpful summary or answer any follow-up questions they might have."
+
+                        messages_for_llm = [{"role": "system", "content": personas['default']}, {"role": "user", "content": context}]
+                        tool_was_used = True
+                        chat_history.append({"role": "user", "content": current_user_input})
+                    except (ValueError, IndexError):
+                        messages_for_llm = [{"role": "system", "content": personas['default']}, {"role": "user", "content": "Tell the user you didn't understand which number they referred to."}]
+                    last_listed_history.clear()
+
+                elif last_listed_history and not selection_match_by_num:
+                    logging.info("MAIN_HISTORY_TOOL: User may be selecting from a previous list by title.")
+                    best_match = None
+                    highest_ratio = 0.4
+                    for i, search in enumerate(last_listed_history):
+                        ratio = SequenceMatcher(None, user_input_lower, search.get('executed_query', '').lower()).ratio()
+                        if ratio > highest_ratio:
+                            highest_ratio = ratio
+                            best_match = search
+
+                    if best_match:
+                        context = "The user has asked for more details on the following past search. Please provide a helpful summary based on the information provided:\n\n"
+                        context += f"--- Logged Search Data ---\n"
+                        context += f"Original Question they asked: '{best_match.get('original_question', 'N/A')}'\n"
+                        context += f"The query you executed was: '{best_match.get('executed_query', 'N/A')}'\n"
+                        context += f"The summary you gave them last time was: '{best_match.get('summary_answer', 'N/A')}'\n\n"
+                        context += "Based on this, please provide a fresh, helpful summary or answer any follow-up questions they might have."
+
+                        messages_for_llm = [{"role": "system", "content": personas['default']}, {"role": "user", "content": context}]
+                        tool_was_used = True
+                        chat_history.append({"role": "user", "content": current_user_input})
+                        last_listed_history.clear()
+                    else:
+                        last_listed_history.clear()
+                        system_prompt = personas['default'] + (f"\n\n--- SUMMARY ---\n{current_memories}" if current_memories else "")
+                        messages_for_llm = [{"role": "system", "content": system_prompt}] + chat_history[1:] + [{"role": "user", "content": current_user_input}]
+                        chat_history.append({"role": "user", "content": current_user_input})
+
+                elif any(keyword in user_input_lower for keyword in HISTORY_KEYWORDS):
+                    logging.info("MAIN_HISTORY_TOOL: User is requesting the history list.")
+                    recent_searches = search_logger.read_recent_searches(count=5)
+                    last_listed_history.clear()
+                    last_listed_history.extend(recent_searches)
+                    if not last_listed_history:
+                        response_text = "It looks like you don't have any searches in your history yet."
+                    else:
+                        response_text = "Okay, here are your most recent searches.."
+                        for i, search in enumerate(last_listed_history):
+                            query = search.get('executed_query', 'an unknown topic')
+                            response_text += f" Number {i+1}: {query}.."
+                    current_generation_id = uuid.uuid4()
+                    prefetch_q.put((current_generation_id, [(response_text, 0)]))
+                    print(f"🤖 Assistant: {response_text}")
+                    chat_history.append({"role": "user", "content": current_user_input})
+                    chat_history.append({"role": "assistant", "content": response_text})
+                    continue
+
+                elif web_tools.check_for_search_keyword(current_user_input):
+                    last_listed_history.clear()
+                    proposed_query = web_tools.check_for_search_keyword(current_user_input)
                     pending_search["query"] = proposed_query
                     pending_search["original_input"] = current_user_input
-
                     confirmation_question = f"I think you want me to search for: \"{proposed_query}\". Is that correct?"
-
-                    # Manually generate the confirmation response without calling the main LLM
                     current_generation_id = uuid.uuid4()
                     prefetch_q.put((current_generation_id, [(confirmation_question, 0)]))
                     print(f"🤖 Assistant: {confirmation_question}")
                     logging.info(f"MAIN_AWAIT_CONFIRM: Waiting for user confirmation for query: '{proposed_query}'")
-                    continue # End the turn here and wait for the user's "yes" or "no"
-
-                # STATE 3: If no search is pending or proposed, it's a normal conversation.
+                    continue
                 else:
+                    last_listed_history.clear()
                     system_prompt = personas['default'] + (f"\n\n--- SUMMARY ---\n{current_memories}" if current_memories else "")
                     messages_for_llm = [{"role": "system", "content": system_prompt}] + chat_history[1:] + [{"role": "user", "content": current_user_input}]
-                    # Save user's turn to history for normal chat
                     chat_history.append({"role": "user", "content": current_user_input})
 
-            # --- LLM Processing and Response Generation ---
-
-            # This block now only runs if there is something for the LLM to say
             current_generation_id = uuid.uuid4()
             logging.info(f"MAIN_NEW_GEN_ID: {current_generation_id.hex[:8]}")
 
@@ -309,15 +415,15 @@ def main():
             logging.info(f"{log_prefix} '{assistant_response[:100]}...'")
             print(f"🤖 Assistant: {assistant_response}")
 
-            # Save the final assistant response to history
             chat_history.append({"role": "assistant", "content": assistant_response})
 
             if tool_was_used:
-                search_logger.log_search(
-                    original_question=pending_search["original_input"],
-                    executed_query=pending_search["query"],
-                    summary_answer=assistant_response
-                )
+                if pending_search.get("query") and pending_search.get("original_input"):
+                    search_logger.log_search(
+                        original_question=pending_search["original_input"],
+                        executed_query=pending_search["query"],
+                        summary_answer=assistant_response
+                    )
                 pending_search["query"] = None
                 pending_search["original_input"] = None
 
