@@ -1,15 +1,11 @@
-# audio_player.py
-
 import logging
 import queue
 import time
 import threading
 import traceback
-
 import numpy as np
 import pyaudio
 import soundfile as sf
-
 import config
 
 class AudioPlayer:
@@ -26,6 +22,7 @@ class AudioPlayer:
         self.prev_tail = np.array([], dtype=np.int16)
         self.next_sequence_to_play = 0
         self.clip_buffer = {}
+        self.last_audio_time = time.monotonic()
 
     def _open_stream(self, rate):
         if self.stream:
@@ -34,14 +31,11 @@ class AudioPlayer:
                 self.stream.close()
             except OSError as e:
                 logging.warning(f"AUDIO_PLAYER_STREAM_CLOSE_WARN: Harmless error closing previous stream: {e}")
-
-        self.stream = self.pa.open(format=pyaudio.paInt16, channels=1, rate=rate, output=True, frames_per_buffer=int(rate * 0.05)) # 50ms buffer
-        self.current_stream_rate = rate
+        self.stream = self.pa.open(format=pyaudio.paInt16, channels=1, rate=rate, output=True, frames_per_buffer=int(rate * 0.05))
 
     def _play_audio_data(self, data_samples, sample_rate):
-        if not self.stream or not self.stream.is_active():
+        if not self.stream or self.current_stream_rate != sample_rate:
             self._open_stream(sample_rate)
-
         fade_len_samples = int(sample_rate * config.CROSSFADE_MS / 1000)
         actual_fade_len = min(len(self.prev_tail), len(data_samples), fade_len_samples)
         if actual_fade_len > 0:
@@ -51,7 +45,6 @@ class AudioPlayer:
             data_to_play = np.concatenate((blended_head, data_samples[actual_fade_len:]))
         else:
             data_to_play = data_samples
-
         chunk_size = 1024
         for i in range(0, len(data_to_play), chunk_size):
             if self.interruption_requested.is_set():
@@ -60,7 +53,6 @@ class AudioPlayer:
                     self.stream.stop_stream()
                 return
             self.stream.write(data_to_play[i:i+chunk_size].tobytes())
-
         if len(data_samples) >= fade_len_samples:
             self.prev_tail = data_samples[-fade_len_samples:]
         else:
@@ -81,10 +73,13 @@ class AudioPlayer:
         try:
             samples, sr = sf.read(str(audio_path_obj), dtype='int16')
             self._play_audio_data(samples, sr)
+            self.last_audio_time = time.monotonic()
         finally:
             if audio_path_obj.exists() and not (config.CACHE_DIR.resolve() in audio_path_obj.resolve().parents):
-                try: audio_path_obj.unlink(missing_ok=True)
-                except Exception as e_del: logging.warning(f"AUDIO_PLAYER_DELETE_FAIL: {e_del}")
+                try:
+                    audio_path_obj.unlink(missing_ok=True)
+                except Exception as e_del:
+                    logging.warning(f"AUDIO_PLAYER_DELETE_FAIL: {e_del}")
 
     def run(self):
         logging.info("AUDIO_PLAYER_READY: Audio player thread started.")
@@ -93,37 +88,43 @@ class AudioPlayer:
                 if self.interruption_requested.is_set():
                     self._reset_playback_state()
                     while not self.audio_q.empty():
-                        try: self.audio_q.get_nowait(); self.audio_q.task_done()
-                        except queue.Empty: break
+                        try:
+                            self.audio_q.get_nowait()
+                            self.audio_q.task_done()
+                        except queue.Empty:
+                            break
                     time.sleep(0.1)
                     continue
 
                 gen_id, sequence, data_item, text_item = self.audio_q.get(timeout=0.2)
-                if data_item is None: break
+                if data_item is None:
+                    break
 
                 if gen_id != self.active_gen_id:
                     self._reset_playback_state()
                     self.active_gen_id = gen_id
                     self.tts_actively_playing.set()
+                    self.last_audio_time = time.monotonic()
                     logging.info(f"AUDIO_PLAYER_NEW_GEN: Starting generation {str(gen_id)[:8]}")
 
                 self.clip_buffer[sequence] = (data_item, text_item)
 
                 while self.next_sequence_to_play in self.clip_buffer:
-                    if self.interruption_requested.is_set(): break
+                    if self.interruption_requested.is_set():
+                        break
                     buffered_data, buffered_text = self.clip_buffer.pop(self.next_sequence_to_play)
-
                     if buffered_text == "[PAUSE]":
                         time.sleep(buffered_data / 1000.0)
                     else:
                         self._play_clip(buffered_data, buffered_text)
                     self.next_sequence_to_play += 1
-
                 self.audio_q.task_done()
 
             except queue.Empty:
-                if not self.clip_buffer and self.tts_actively_playing.is_set():
-                    self._reset_playback_state()
+                if self.tts_actively_playing.is_set():
+                    if time.monotonic() - self.last_audio_time > 5.0:
+                        logging.warning("AUDIO_PLAYER_TIMEOUT: No audio received for 5s. Ending generation.")
+                        self._reset_playback_state()
                 continue
             except Exception as e:
                 logging.error(f"AUDIO_PLAYER_ERROR: An exception occurred: {e}", exc_info=True)
@@ -135,11 +136,11 @@ class AudioPlayer:
                         logging.error(f"AUDIO_PLAYER_STREAM_CLEANUP_ERROR: {e_close}")
                 self.stream = None
                 self._reset_playback_state()
-
         if self.stream:
             try:
                 self.stream.stop_stream()
                 self.stream.close()
-            except: pass
+            except:
+                pass
         self.pa.terminate()
         logging.info("AUDIO_PLAYER_SHUTDOWN")

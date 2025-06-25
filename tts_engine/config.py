@@ -22,6 +22,7 @@ CLEANUP_FOLDERS = [OUTPUT_DIR]
 SUMMARY_BOT_TEMPLATE = ROOT_DIR / "personas/chat_summary_bot.txt"
 MOOD_CLASSIFIER_BOT = ROOT_DIR / "personas/mood_classifier_bot.txt"
 PERSONA_PROMPT_TEMPLATE = ROOT_DIR / "personas/tts_default.txt"
+SCRAPE_SUMMARY_BOT_TEMPLATE = ROOT_DIR / "personas/scrape_summary_bot.txt"
 
 
 # ==============================================================================
@@ -39,6 +40,10 @@ TOKEN_SOFT_LIMIT = 2500
 TOKEN_HARD_LIMIT = 7700
 KEEP_RECENT = 2
 
+# ==============================================================================
+# == WEB API & SERVICE CONFIGURATION ==
+# ==============================================================================
+TOOL_SERVER_URL="http://127.0.0.1:5007"
 
 # ==============================================================================
 # == VAD & ASR CONFIGURATION ==
