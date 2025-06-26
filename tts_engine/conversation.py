@@ -2,525 +2,471 @@
 # -*- coding: utf-8 -*-
 # convo.py
 
-import json, os, pathlib, queue, re, sys, threading, traceback, uuid, random
+import json, os, queue, re, sys, threading, traceback, uuid, random, time, logging, pathlib
+from pathlib import Path
 from datetime import datetime
 from difflib import SequenceMatcher
-import time
+from datetime import datetime
 
-import numpy as np, requests, sounddevice as sd, soundfile as sf
+import numpy as np
+import requests
 import torch
-import whisper
+import httpx
 
-# --- NEW: Import the chunker library ---
+import sounddevice as sd
+import soundfile as sf
+from pydub import AudioSegment
+
+import config
+
+import web_tools
+
+import search_logger
+
 from streaming_chunker import StreamingChunker
-
-os.environ["NEMO_DISABLE_TQDM"] = "1"
-
-# --- VAD & ASR Configuration ---
-VAD_INTERRUPT_TIMEOUT_S           = 0.2
-VAD_DEFAULT_SILENCE_TIMEOUT_S     = 1.2
-VAD_LONG_PROMPT_TIMEOUT_S         = 2.0
-VAD_LONG_PROMPT_TRIGGER_S         = 3.0
-INTERRUPTION_DURATION_THRESHOLD_S = 4
-
-MIN_WORDS_ASR                     = 1
-VAD_MIN_SPEECH_S                  = 0.25
-VAD_SPEECH_CONFIDENCE_THRESHOLD   = 0.3
-ECHO_SIMILARITY_THRESHOLD         = 0.7
-
-WHISPER_BEAM_SIZE                 = 5
-WHISPER_LOGPROB_THRESHOLD         = -1.0
-WHISPER_NO_SPEECH_THRESHOLD       = 0.6
-
-# --- Core Application Settings ---
-LM_STUDIO_CHAT_URL = "http://localhost:1234/v1/chat/completions"
-ORPHEUS_API_URL    = "http://127.0.0.1:5005/v1/audio/speech"
-VOICE              = "tara"
-MIN_WORDS_FOR_CHUNK= 8 # Parameter for the new StreamingChunker
-TOKEN_SOFT_LIMIT   = 2500
-TOKEN_HARD_LIMIT   = 7700
-KEEP_RECENT        = 2
-
-# --- USER PATHS ---
-OUTPUT_DIR = pathlib.Path("outputs")
-CACHE_DIR  = pathlib.Path("../cached_clips")
-OUTPUT_DIR.mkdir(exist_ok=True)
-
-CLEANUP_FOLDERS = [
-    OUTPUT_DIR,
-    pathlib.Path("../outputs"),
-]
-
-SUMMARY_BOT_TEMPLATE    = pathlib.Path("../personas/chat_summary_bot.txt")
-PERSONA_PROMPT_TEMPLATE = pathlib.Path("../personas/tts_default.txt")
-
-TTS_REQUEST_TIMEOUT = (10, 30)
-# --- Regex for filtering/history (minimal set) ---
-WORD_COUNT_THRESHOLD_FOR_TAGGED_SENTENCE_DISCARD = 2
-STANDALONE_TAG_RE = re.compile(r"^\s*<[^>]+>\s*$")
-ANY_BRACKETED_TAG_RE = re.compile(r"<[^>]+>")
-ACTION_RE = re.compile(r'\*[^\*]+\*|_[^_]+_|\([^)]+\)|[\U0001F300-\U0001F9FF]')
-LLM_SPECIAL_TOKENS_RE = re.compile(r'<\|.*?\|>')
-
-
-try:
-    with open(PERSONA_PROMPT_TEMPLATE, "r", encoding="utf-8") as f:
-        PERSONA_TEMPLATE = f.read()
-    print(f"✅ Loaded default persona from: {PERSONA_PROMPT_TEMPLATE}")
-except FileNotFoundError:
-    print(f"‼️ FATAL: Persona file not found at '{PERSONA_PROMPT_TEMPLATE}'. Please ensure it exists.")
-    sys.exit(1)
-
-try:
-    with open(SUMMARY_BOT_TEMPLATE, "r", encoding="utf-8") as f:
-        SUMMARY_PROMPT = f.read()
-    print(f"✅ Loaded summarizer persona from: {SUMMARY_BOT_TEMPLATE}")
-except FileNotFoundError:
-    print(f"⚠️ WARNING: Summarizer persona file not found at '{SUMMARY_BOT_TEMPLATE}'. Using a default.")
-    SUMMARY_PROMPT = "You are a summarization bot. Your task is to update a running summary of a conversation."
+from llm_classifier import LLMStyleClassifier
+from audio_player import AudioPlayer
+from voice_listener import VoiceListener
+from tts_service import TTSService
 
 audio_q, prefetch_q, user_q, memory_q = (queue.Queue() for _ in range(4))
-
-interruption_requested = threading.Event()
-tts_actively_playing = threading.Event()
-program_is_shutting_down = threading.Event()
-INTERRUPT_KEYWORDS = {"stop", "shut up", "hold on", "wait", "enough", "nevermind", "cancel", "that's enough"}
-
-last_tts_text = ""
+interruption_requested, tts_actively_playing, program_is_shutting_down = threading.Event(), threading.Event(), threading.Event()
+last_tts_text_ref = [""]
 current_generation_id = None
 
-# --- HISTORY SANITATION: The only sanitation function left in this file ---
-def strip_action_and_emoji(text_input: str) -> str:
-    """Cleans the full text response before it's saved to chat history."""
-    if not isinstance(text_input, str): return ""
-    text = text_input
-    text = ANY_BRACKETED_TAG_RE.sub('', text)
-    text = ACTION_RE.sub('', text)
-    text = LLM_SPECIAL_TOKENS_RE.sub('',text)
-    text = re.sub(r'\s+', ' ', text).strip()
-    return text
+pending_search = {"query": None, "original_input": None}
+CONFIRMATION_KEYWORDS = {"yes", "yep", "yeah", "that's right", "correct", "indeed", "go ahead", "do it", "sure"}
 
-# --- Worker Threads ---
+HISTORY_KEYWORDS = {"what was my last search", "show my search history", "what were my recent searches", "list my searches", "list my search history", "what is my search history"}
 
-def asr_listener():
-    print("🎤 Loading Whisper ASR & Silero VAD…")
-    try:
-        asr_model = whisper.load_model("small.en")
-        print("🎤 Whisper 'small.en' model loaded.")
-        vad_model, utils = torch.hub.load(repo_or_dir='snakers4/silero-vad', model='silero_vad', force_reload=False)
-        (get_speech_timestamps, save_audio, read_audio, VADIterator, collect_chunks) = utils
-        print("🎤 Silero VAD model loaded.")
-    except Exception as e:
-        print(f"‼️ FATAL: Could not load ASR/VAD models: {e}"); traceback.print_exc()
-        program_is_shutting_down.set(); return
+last_listed_history = []
 
-    sr = 16000
-    vad_chunk_size = 512
-    min_speech_frames = int(VAD_MIN_SPEECH_S * 1000 / (vad_chunk_size / sr * 1000))
-    is_speaking = False; audio_buffer = []; silence_counter = 0
+logging.basicConfig(level=logging.INFO, format='%(asctime)s.%(msecs)03d %(levelname)-7s [%(threadName)-15s] %(message)s', datefmt='%H:%M:%S')
+logging.getLogger("http.client").setLevel(logging.WARNING)
+llm_classifier_instance = None
 
-    try:
-        with sd.InputStream(samplerate=sr, channels=1, dtype='float32', blocksize=vad_chunk_size, callback=None) as stream:
-            print("🎤 Continuous ASR listening (Literal Transcription Mode)…")
-            while not program_is_shutting_down.is_set():
-                try:
-                    frame_float32, overflowed = stream.read(vad_chunk_size)
-                    if overflowed: print("‼️ Mic overflow!", file=sys.stderr); continue
-                    audio_tensor = torch.from_numpy(frame_float32.flatten())
-                    speech_confidence = vad_model(audio_tensor, sr).item()
-                    is_speech_in_frame = speech_confidence > VAD_SPEECH_CONFIDENCE_THRESHOLD
-                    if is_speaking:
-                        audio_buffer.append(frame_float32)
-                        if is_speech_in_frame:
-                            silence_counter = 0
-                        else:
-                            silence_counter += 1
-                            active_timeout_s = VAD_DEFAULT_SILENCE_TIMEOUT_S
-                            if tts_actively_playing.is_set():
-                                active_timeout_s = VAD_INTERRUPT_TIMEOUT_S
-                            else:
-                                current_audio_data = np.concatenate(audio_buffer).squeeze()
-                                if len(current_audio_data) > 0:
-                                    speech_timestamps = get_speech_timestamps(torch.from_numpy(current_audio_data), vad_model, sampling_rate=sr)
-                                    if speech_timestamps:
-                                        precise_speech_duration_s = (speech_timestamps[-1]['end'] - speech_timestamps[0]['start']) / sr
-                                        if precise_speech_duration_s > VAD_LONG_PROMPT_TRIGGER_S:
-                                            active_timeout_s = VAD_LONG_PROMPT_TIMEOUT_S
-                            silence_frames_needed = int(active_timeout_s / (vad_chunk_size / sr))
-                            if silence_counter >= silence_frames_needed:
-                                is_speaking = False
-                                end_of_speech_time = time.monotonic()
-                                if len(audio_buffer) >= min_speech_frames:
-                                    full_audio = np.concatenate(audio_buffer).squeeze()
-                                    txt = asr_model.transcribe(full_audio, fp16=torch.cuda.is_available())['text'].strip()
-                                    processing_lag_s = time.monotonic() - end_of_speech_time
-                                    if txt:
-                                        is_echo = False
-                                        if tts_actively_playing.is_set() and last_tts_text:
-                                            similarity = SequenceMatcher(None, txt.lower(), last_tts_text.lower()).ratio()
-                                            if similarity > ECHO_SIMILARITY_THRESHOLD:
-                                                print(f"🎤 Echo detected (Similarity: {similarity:.2f}), discarding.", file=sys.stderr); is_echo = True
-                                        if not is_echo and len(txt.split()) >= MIN_WORDS_ASR:
-                                            speech_duration_s = len(full_audio) / sr
-                                            print(f"\n🗣️ User (ASR): '{txt}' (Duration: {speech_duration_s:.2f}s, VAD Lag: {processing_lag_s:.2f}s)")
-                                            if tts_actively_playing.is_set() and not interruption_requested.is_set():
-                                                print("🎤 ASR: User spoke while TTS active -> Setting INTERRUPT_REQUESTED"); interruption_requested.set()
-                                            user_q.put((txt, speech_duration_s))
-                                audio_buffer = []
-                    elif is_speech_in_frame:
-                        is_speaking = True
-                        silence_counter = 0
-                        audio_buffer = [frame_float32]
-                        if not tts_actively_playing.is_set(): print("\n🎤 Speech detected…", end='', flush=True)
-                except sd.PortAudioError as pae:
-                    if "Input overflowed" in str(pae): print("‼️ Mic overflow (PortAudioError)!", file=sys.stderr); continue
-                    print(f"‼️ ASR PortAudioError: {pae}", file=sys.stderr); sd.sleep(1)
-                except Exception as e:
-                    if program_is_shutting_down.is_set(): break
-                    print(f"‼️ ASR loop error: {e}", file=sys.stderr); traceback.print_exc(); is_speaking = False; audio_buffer = []; silence_counter = 0; sd.sleep(1)
-    except Exception as e: print(f"‼️ ASR: Could not open InputStream: {e}"); traceback.print_exc()
-    print("🎤 ASR listener thread finished.")
+def strip_action_and_emoji(text: str) -> str:
+    if not isinstance(text, str): return ""
+    text = re.sub(r"<[^>]+>", '', text)
+    text = re.sub(r'\*[^\*]+\*|_[^_]+_|\([^)]+\)|[\U0001F300-\U0001F9FF]', '', text)
+    text = re.sub(r'<\|.*?\|>', '', text)
+    return " ".join(text.split())
+
+def rough_tokens(txt: str) -> int: return max(1, len(txt) // 4)
 
 def kb_listener():
-    print("⌨️ Keyboard listener started.")
+    logging.info("KB_LISTENER_READY: Keyboard listener started.")
     while not program_is_shutting_down.is_set():
         try:
             line = input("\n⌨️  ").strip()
             if program_is_shutting_down.is_set(): break
             if line:
-                if tts_actively_playing.is_set() and line.lower() in INTERRUPT_KEYWORDS:
-                    print(f"⌨️ Interrupt command: '{line}' -> Setting INTERRUPT_REQUESTED")
-                    if not interruption_requested.is_set(): interruption_requested.set()
+                logging.info(f"USER_KB_INPUT: '{line}'")
+                if tts_actively_playing.is_set() and line.lower() in config.INTERRUPT_KEYWORDS:
+                    interruption_requested.set()
                 user_q.put((line, 0.0))
-        except EOFError: print("⌨️ EOF received, exiting keyboard listener."); break
-        except KeyboardInterrupt: print("\n⌨️ Keyboard interrupt in listener. Exiting."); break
+        except (EOFError, KeyboardInterrupt): break
         except Exception as e:
-            if program_is_shutting_down.is_set(): break
-            print(f"‼️ KB Listener error: {e}"); traceback.print_exc(); break
-    print("⌨️ Keyboard listener thread finished.")
-
-def audio_player():
-    global last_tts_text
-    print("🎵 Audio player thread started.")
-    player_active_gen_id = None
-    while not program_is_shutting_down.is_set():
-        try:
-            gen_id, p_path_obj, text_that_was_spoken = audio_q.get(timeout=0.1)
-        except queue.Empty:
-            if not tts_actively_playing.is_set(): player_active_gen_id = None
-            continue
-        if p_path_obj is None: print("🎵 AudioPlayer: Shutdown sentinel received."); break
-        if interruption_requested.is_set():
-            if p_path_obj and p_path_obj.exists() and not p_path_obj.is_relative_to(CACHE_DIR):
-                 p_path_obj.unlink(missing_ok=True)
-            player_active_gen_id = None; audio_q.task_done(); continue
-        if player_active_gen_id is None:
-            if gen_id != current_generation_id:
-                print(f"🎵 AudioPlayer: Discarding stale audio chunk. File: {p_path_obj.name if p_path_obj else 'N/A'}", file=sys.stderr)
-                if p_path_obj and p_path_obj.exists() and not p_path_obj.is_relative_to(CACHE_DIR):
-                    p_path_obj.unlink(missing_ok=True)
-                audio_q.task_done(); continue
-            player_active_gen_id = gen_id
-        elif gen_id != player_active_gen_id:
-            print(f"🎵 AudioPlayer: Gen ID mismatch. Discarding. File: {p_path_obj.name if p_path_obj else 'N/A'}", file=sys.stderr)
-            if p_path_obj and p_path_obj.exists() and not p_path_obj.is_relative_to(CACHE_DIR):
-                p_path_obj.unlink(missing_ok=True)
-            audio_q.task_done(); continue
-        is_filler_audio = (text_that_was_spoken == "[FILLER_AUDIO]")
-        try:
-            if not p_path_obj or not p_path_obj.exists():
-                print(f"🎵 AudioPlayer: Audio file path is invalid: {p_path_obj}", file=sys.stderr)
-                audio_q.task_done(); continue
-            data, sr_audio = sf.read(str(p_path_obj), dtype="float32")
-            last_tts_text_candidate = text_that_was_spoken
-            tts_actively_playing.set()
-            if is_filler_audio: print(f"🎵 Playing FILLER audio: {p_path_obj.name}")
-            else: print(f"🎵 Playing TTS: '{text_that_was_spoken}' ({p_path_obj.name})")
-            sd.play(data, sr_audio); sd.wait()
-            if not is_filler_audio: last_tts_text = last_tts_text_candidate
-        except Exception as e: print(f"‼️ Audio playback error for '{p_path_obj}': {e}", file=sys.stderr); traceback.print_exc()
-        finally:
-            tts_actively_playing.clear()
-            if not is_filler_audio and last_tts_text == text_that_was_spoken:
-                 last_tts_text = ""
-            if p_path_obj and p_path_obj.exists() and not p_path_obj.is_relative_to(CACHE_DIR):
-                try: p_path_obj.unlink(missing_ok=True)
-                except Exception: pass
-            audio_q.task_done()
-    print("🎵 Audio player thread finished.")
-
-def tts_requester_thread(text_chunk, generation_id):
-    try:
-        if program_is_shutting_down.is_set() or generation_id != current_generation_id: return
-        audio_file = tts_request(text_chunk, generation_id)
-        if audio_file:
-            audio_q.put((generation_id, audio_file, text_chunk))
-    except Exception as e: print(f"‼️ TTS Requester Thread error for chunk '{text_chunk[:30]}...': {e}"); traceback.print_exc()
-
-def prefetch_worker():
-    print("⏳ Prefetch worker thread started.")
-    while not program_is_shutting_down.is_set():
-        try:
-            generation_id, chunks_to_prefetch = prefetch_q.get(timeout=0.2)
-        except queue.Empty: continue
-        if chunks_to_prefetch is None: print("⏳ Prefetch worker: Shutdown sentinel received."); break
-        if generation_id != current_generation_id: prefetch_q.task_done(); continue
-
-        fetch_threads = []
-        for text_chunk in chunks_to_prefetch:
-            if program_is_shutting_down.is_set() or interruption_requested.is_set() or generation_id != current_generation_id:
-                break
-
-            # This secondary filter remains as a simple safeguard.
-            if STANDALONE_TAG_RE.fullmatch(text_chunk.strip()):
-                print(f"PREFETCH_FILTER: DISCARDING standalone tag: '{text_chunk[:50]}'", file=sys.stderr)
-                continue
-
-            thread = threading.Thread(target=tts_requester_thread, args=(text_chunk, generation_id))
-            thread.daemon = True; fetch_threads.append(thread); thread.start()
-
-        for thread in fetch_threads:
-            thread.join()
-
-        prefetch_q.task_done()
-    print("⏳ Prefetch worker thread finished.")
-
-rough_tokens = lambda txt: max(1, len(txt)//4)
-
-def summarise(prev_summary, new_transcript):
-    if program_is_shutting_down.is_set(): return prev_summary or "[summary skipped]"
-    try:
-        content = f"PREVIOUS SUMMARY:\n{prev_summary or 'None.'}\n\nNEW TRANSCRIPT TO ADD:\n{new_transcript}"
-        r = requests.post(LM_STUDIO_CHAT_URL, json={"model": "hermes", "messages": [{"role": "system", "content": SUMMARY_PROMPT}, {"role": "user", "content": content}], "temperature": 0.6, "max_tokens": 1024}, timeout=200)
-        r.raise_for_status(); summary_text = r.json()['choices'][0]['message']['content'].strip()
-        if summary_text.lower().startswith("updated summary:"): summary_text = summary_text.split(":", 1)[1].strip()
-        return summary_text
-    except Exception as e: print(f"‼️ Summary failed: {e}", file=sys.stderr); return prev_summary or "[summary failed]"
-
-def hermes_chat(msgs):
-    llm_response_stream = None
-    try:
-        llm_response_stream = requests.post(LM_STUDIO_CHAT_URL, json={"model":"hermes","messages":msgs,"temperature":0.9,"stream":True}, stream=True,timeout=(10,60))
-        llm_response_stream.raise_for_status()
-        buffer = ""
-        for chunk in llm_response_stream.iter_content(chunk_size=None, decode_unicode=True):
-            if program_is_shutting_down.is_set() or interruption_requested.is_set():
-                print("\n🚫 LLM stream interrupted.", file=sys.stderr); break
-            buffer += chunk
-            while 'data: ' in buffer and '\n' in buffer:
-                event_start = buffer.find('data: ')
-                line_end = buffer.find('\n', event_start)
-                if line_end == -1: break
-                line = buffer[event_start:line_end]
-                try:
-                    data = line.split('data: ', 1)[1].strip()
-                    if data == '[DONE]':
-                        buffer = buffer[line_end+1:]; return
-                    if data:
-                        delta = json.loads(data)['choices'][0]['delta']
-                        if 'content' in delta:
-                            yield delta['content']
-                except (json.JSONDecodeError, IndexError):
-                    pass # Incomplete data, wait for more
-                buffer = buffer[line_end+1:]
-    except requests.exceptions.RequestException as e: print(f"‼️ Hermes network error: {e}", file=sys.stderr)
-    except Exception as e: print(f"‼️ Unhandled Hermes error: {e}", file=sys.stderr); traceback.print_exc()
-    finally:
-        if llm_response_stream:
-            try: llm_response_stream.close()
-            except Exception: pass
-
-def tts_request(txt, generation_id):
-    if program_is_shutting_down.is_set() or (generation_id is not None and generation_id != current_generation_id):
-        return None
-
-    # The 'txt' payload is now received pre-sanitized from the chunker.
-    if not txt:
-        return None
-
-    try:
-        wav_data = requests.post(ORPHEUS_API_URL,json={"input": txt,"model":"orpheus","voice":VOICE,"response_format":"wav","speed":1.0},timeout=TTS_REQUEST_TIMEOUT).content
-        if len(wav_data) < 1000:
-             print(f"🎤 TTS: Short/Invalid WAV received for '{txt[:30]}...'. Skipping.", file=sys.stderr); return None
-        file_name = datetime.utcnow().strftime("%Y%m%d_%H%M%S_")+uuid.uuid4().hex[:8]+".wav"; output_path = OUTPUT_DIR/file_name
-        output_path.write_bytes(wav_data); return output_path
-    except requests.exceptions.RequestException as e:
-        print(f"‼️ TTS API failed for '{txt[:30]}...': {e}", file=sys.stderr); return None
-    except Exception as e:
-        print(f"‼️ TTS error for '{txt[:30]}...': {e}", file=sys.stderr); traceback.print_exc(); return None
+            if not program_is_shutting_down.is_set(): logging.error(f"KB_LISTENER_ERROR: {e}", exc_info=True)
+    logging.info("KB_LISTENER_SHUTDOWN")
 
 def cleanup_old_audio():
-    print("🧹 Cleaning up old audio files...")
-    count = 0
-    for folder_path in CLEANUP_FOLDERS:
-        if not folder_path.is_dir(): continue
-        for audio_file in folder_path.glob("*.wav"):
+    logging.info("CLEANUP_AUDIO_START: Cleaning up old audio files...")
+    cleaned_count = 0
+    for folder_to_clean in set([config.OUTPUT_DIR]):
+        if not folder_to_clean.is_dir(): continue
+        for f_path in folder_to_clean.glob("*.wav"):
             try:
-                if CACHE_DIR.resolve() in audio_file.resolve().parents:
-                    continue
-                audio_file.unlink(); count += 1
-            except Exception as e: print(f"🧹 Could not delete {audio_file}: {e}", file=sys.stderr)
-    if count > 0: print(f"🧹 Removed {count} old .wav file(s).")
+                if config.CACHE_DIR.resolve() in f_path.resolve().parents: continue
+                f_path.unlink(missing_ok=True)
+                cleaned_count +=1
+            except Exception as e: logging.warning(f"CLEANUP_AUDIO_FAIL: Could not delete {f_path}: {e}")
+    logging.info(f"CLEANUP_AUDIO_DONE: Deleted {cleaned_count} file(s).")
+
+def hermes_chat(msgs):
+    try:
+        buffer = ""
+        is_in_think_block = False
+
+        with httpx.stream("POST",
+                         config.LM_STUDIO_CHAT_URL,
+                         json={"model": "grok-3-reasoning-gemma3-12b-distilled", "messages": msgs, "temperature": 0.6, "stream": True},
+                         timeout=httpx.Timeout(10.0, read=60.0)) as r:
+            r.raise_for_status()
+            for chunk in r.iter_text():
+                if interruption_requested.is_set() or program_is_shutting_down.is_set(): break
+                buffer += chunk
+
+                while True:
+                    if is_in_think_block:
+                        end_tag_pos = buffer.find('</think>')
+                        if end_tag_pos != -1:
+                            thought_process = buffer[:end_tag_pos]
+                            logging.info(f"LLM_THOUGHT: {thought_process.strip()}")
+                            buffer = buffer[end_tag_pos + len('</think>'):]
+                            is_in_think_block = False
+                        else:
+                            break
+
+                    start_tag_pos = buffer.find('<think>')
+                    if start_tag_pos != -1:
+                        pre_think_text = buffer[:start_tag_pos]
+                        if pre_think_text:
+                            for event in process_json_events(pre_think_text):
+                                yield event
+
+                        buffer = buffer[start_tag_pos + len('<think>'):]
+                        is_in_think_block = True
+                    else:
+                        if buffer:
+                            for event in process_json_events(buffer):
+                                yield event
+                            buffer = ""
+                        break
+
+    except Exception as e:
+        if not program_is_shutting_down.is_set(): logging.error(f"LLM_STREAM_ERROR: {e}", exc_info=True)
+
+def process_json_events(text_chunk):
+    """Helper generator to process the Server-Sent Events (SSE) JSON from the buffer."""
+    buffer = text_chunk
+    while 'data: ' in buffer and '\n' in buffer:
+        event_start = buffer.find('data: ')
+        line_end = buffer.find('\n', event_start)
+        if line_end == -1: break
+
+        line = buffer[event_start:line_end]
+        buffer = buffer[line_end+1:]
+
+        try:
+            data_str = line.split('data: ', 1)[1].strip()
+            if data_str == '[DONE]': return
+            if data_str:
+                delta = json.loads(data_str)['choices'][0]['delta']
+                if 'content' in delta and delta['content'] is not None:
+                    yield delta['content']
+        except (json.JSONDecodeError, IndexError, KeyError):
+            pass
+
+def summarise(prev_summary, new_transcript):
+    try:
+        content = f"PREVIOUS SUMMARY:\n{prev_summary or 'None.'}\n\nNEW TRANSCRIPT TO ADD:\n{new_transcript}"
+        if not SUMMARY_PROMPT: return prev_summary or "[summary failed: no prompt]"
+        r = requests.post(config.LM_STUDIO_CHAT_URL, json={"model": "hermes", "messages": [{"role": "system", "content": SUMMARY_PROMPT}, {"role": "user", "content": content}], "temperature": 0.6, "max_tokens": 1024}, timeout=200)
+        r.raise_for_status()
+        summary_text = r.json()['choices'][0]['message']['content'].strip()
+        return summary_text.replace("Updated Summary:", "").strip()
+    except Exception as e:
+        logging.error(f"SUMMARY_FAIL: {e}", exc_info=True)
+        return prev_summary or "[summary failed: exception]"
+
+def play_startup_greeting_thread(audio_path_obj):
+    try:
+        data_audio, sr_audio = sf.read(audio_path_obj, dtype='float32')
+        sd.play(data_audio, sr_audio)
+        sd.wait()
+    except Exception as e: logging.warning(f"GREETING_PLAY_ERROR: '{audio_path_obj.name}': {e}", exc_info=True)
+
+def warmup_tts():
+    try:
+        payload = {"input": "The system is ready.", "model": "orpheus", "voice": config.VOICE, "response_format": "wav", "speed": 1.0}
+        requests.post(config.ORPHEUS_API_URL, json=payload, timeout=(5,10)).raise_for_status()
+        logging.info("TTS_WARMUP: Successful.")
+    except Exception as e: logging.warning(f"TTS_WARMUP_FAIL: {e}")
 
 def main():
-    global current_generation_id
+    global current_generation_id, personas, SUMMARY_PROMPT, llm_classifier_instance
+    logging.info("MAIN_INIT: Application starting...")
     cleanup_old_audio()
     interruption_requested.clear(); tts_actively_playing.clear(); program_is_shutting_down.clear()
-    chat_history=[{"role":"system","content":PERSONA_TEMPLATE}]; current_memories = ""
+    chat_history=[{"role":"system","content":""}]; current_memories = ""
 
-    interrupt_audio_files, pending_audio_files, long_query_audio_files = [], [], []
-    if CACHE_DIR.is_dir():
-        interrupt_audio_files = list(CACHE_DIR.glob("*_interrupt_cache.wav"))
-        pending_audio_files = list(CACHE_DIR.glob("*_pending_cache.wav"))
-        long_query_audio_files = list(CACHE_DIR.glob("*_long_query_cache.wav"))
-        if interrupt_audio_files: print(f"🎤 Found {len(interrupt_audio_files)} interrupt acknowledgement clips.")
-        if pending_audio_files: print(f"🎤 Found {len(pending_audio_files)} pending clips.")
-        if long_query_audio_files: print(f"🎤 Found {len(long_query_audio_files)} long query clips.")
-    else: print(f"🎤 WARNING: Cache directory '{CACHE_DIR}' not found, filler audio will be disabled.")
+    def get_current_generation_id():
+        return current_generation_id
 
+    try:
+        today_str    = datetime.now().strftime('%Y-%m-%d')
+        date_context = f"Today is {today_str}."
+        personas = {
+            'default': Path(config.PERSONA_PROMPT_TEMPLATE).read_text(encoding="utf-8"),
+            'summarizer': Path(config.SCRAPE_SUMMARY_BOT_TEMPLATE).read_text(encoding="utf-8").replace("<<DATE>>", date_context),
+        }
+        SUMMARY_PROMPT = Path(config.SUMMARY_BOT_TEMPLATE).read_text(encoding="utf-8")
+        llm_classifier_instance = None
+    except Exception as e:
+        logging.critical(f"MAIN_FATAL_INIT: Could not load persona files: {e}", exc_info=True)
+        sys.exit(1)
+
+    chat_history[0]["content"] = personas['default']
+
+    if config.CACHE_DIR.is_dir():
+        interrupt_audio_files = list(config.CACHE_DIR.glob("*_interrupt_cache.wav"))
+        greeting_files = list(config.CACHE_DIR.glob("*_greeting_cache.wav"))
+        if greeting_files:
+            greeting_thread = threading.Thread(target=play_startup_greeting_thread, args=(random.choice(greeting_files),), daemon=True, name="GreetingPlayer")
+            greeting_thread.start()
     def memory_manager_worker():
-        nonlocal current_memories; print("🧠 Memory manager thread started.")
+        nonlocal current_memories
         while not program_is_shutting_down.is_set():
-            try: prev_mems, transcript_to_add = memory_q.get(timeout=0.2)
+            try:
+                prev_mems, transcript_to_add = memory_q.get(timeout=0.2)
+                if prev_mems is None: break
+                current_memories = summarise(prev_mems, transcript_to_add)
+                memory_q.task_done()
             except queue.Empty: continue
-            if prev_mems is None and transcript_to_add is None: print("🧠 Memory manager shutdown.");break
-            current_memories = summarise(prev_mems, transcript_to_add)
-            print(f"🔹 Memories updated to: '{current_memories[:100].replace(os.linesep, ' ')}...'")
-            memory_q.task_done()
-        print("🧠 Memory manager thread finished.")
-
-    threads = [(threading.Thread(target=f,daemon=d, name=n)) for f,d,n in [
-            (audio_player,True,"AudioPlayerThread"), (prefetch_worker,True,"PrefetchThread"),
-            (asr_listener,True,"ASRListenerThread"), (kb_listener,True,"KBListenerThread"),
-            (memory_manager_worker,True,"MemoryManagerThread")]]
-    for t in threads: t.start()
-    print("🎙️  Talk or type anytime — 'quit' to exit, 'mem'/'dump' commands, or interrupt (e.g., 'stop').")
+            except Exception as e: logging.error(f"MEMORY_WORKER_ERROR: {e}", exc_info=True)
+    audio_player = AudioPlayer(audio_q, tts_actively_playing, interruption_requested, program_is_shutting_down, last_tts_text_ref)
+    voice_listener = VoiceListener(user_q, tts_actively_playing, interruption_requested, last_tts_text_ref, program_is_shutting_down)
+    tts_service = TTSService(prefetch_q, audio_q, interruption_requested, program_is_shutting_down, get_current_generation_id)
+    threads = {
+        "AudioPlayer": threading.Thread(target=audio_player.run, daemon=True),
+        "TTSService": threading.Thread(target=tts_service.run, daemon=True),
+        "VoiceListener": threading.Thread(target=voice_listener.run, daemon=True),
+        "KBListener": threading.Thread(target=kb_listener, daemon=True),
+        "MemoryManager": threading.Thread(target=memory_manager_worker, daemon=True),
+    }
+    for name, thread in threads.items():
+        thread.name = name
+        thread.start()
+        logging.info(f"MAIN_THREAD_START: Started {name}")
+    warmup_tts()
+    print("🎙️ System ready. Talk or type anytime. Check logs for detailed info.")
 
     try:
         while not program_is_shutting_down.is_set():
+            if interruption_requested.is_set():
+                logging.info("MAIN_INTERRUPT_HANDLING_START")
+                interruption_requested.clear()
+
+                tts_actively_playing.clear()
+
+                for q in [audio_q, prefetch_q]:
+                    while not q.empty():
+                        try:
+                            q.get_nowait()
+                            q.task_done()
+                        except queue.Empty:
+                            break
+                logging.info("MAIN_INTERRUPT: Audio queues cleared.")
+
+                if 'interrupt_audio_files' in locals() and interrupt_audio_files:
+                    try:
+                        data_int, sr_int = sf.read(random.choice(interrupt_audio_files), dtype='float32')
+                        sd.play(data_int, sr_int)
+                        sd.wait()
+                    except Exception as e:
+                        logging.warning(f"MAIN_INTERRUPT_SOUND_FAIL: {e}")
+
+                if not user_q.empty():
+                    try:
+                        interruption_input, _ = user_q.get_nowait()
+                        user_q.task_done()
+                        logging.info(f"MAIN_INTERRUPT: Discarding user input that caused interruption: '{interruption_input}'")
+                    except queue.Empty:
+                        pass
+
+                logging.info("MAIN_INTERRUPT_HANDLING_DONE: Ready for new input.")
+                continue
+
             try:
-                current_user_input, speech_duration = user_q.get(timeout=0.2)
+                current_user_input, _ = user_q.get(timeout=0.2)
                 user_q.task_done()
             except queue.Empty:
                 if program_is_shutting_down.is_set(): break
                 continue
 
-            was_an_interruption = interruption_requested.is_set()
+            turn_start_time = time.monotonic()
+            logging.info(f"MAIN_TURN_START: Processing: '{current_user_input[:100]}...'")
 
-            if was_an_interruption:
-                print("MAIN: Interruption detected. Cleaning up...")
-                sd.stop(); tts_actively_playing.clear()
-                for q in [audio_q, prefetch_q]:
-                    while not q.empty():
-                        try: q.get_nowait(); q.task_done()
-                        except Exception: pass
+            if current_user_input.lower() in {"quit", "exit"}: break
+            if current_user_input.lower() == "mem": print(f"\n--- MEMORY ---\n{current_memories or '[none]'}\n---"); continue
+            if current_user_input.lower() == "dump": print("\n--- CHAT DUMP ---"); [print(f"[{m['role']}] {m['content']}") for m in chat_history]; print("---"); continue
 
-                if interrupt_audio_files:
+            messages_for_llm = []
+            tool_was_used = False
+
+            if pending_search["query"]:
+                user_response_lower = current_user_input.lower().strip().rstrip('.!')
+                if user_response_lower in CONFIRMATION_KEYWORDS:
+                    logging.info("MAIN_CONFIRMATION: User confirmed search. Executing.")
+                    messages_for_llm = web_tools.execute_search_and_summarize(
+                        user_input=pending_search["original_input"],
+                        search_query=pending_search["query"],
+                        personas=personas
+                    )
+                    tool_was_used = True
+                    chat_history.append({"role": "user", "content": pending_search["original_input"]})
+                else:
+                    logging.info("MAIN_CONFIRMATION: User denied search. Cancelling.")
+                    messages_for_llm = [{"role": "system", "content": personas['default']}, {"role": "user", "content": "Acknowledge that you have cancelled the requested action and ask what they would like to do instead."}]
+                    chat_history.append({"role": "user", "content": pending_search["original_input"]})
+                    pending_search["query"] = None
+                    pending_search["original_input"] = None
+            else:
+                user_input_lower = current_user_input.lower()
+                selection_match_by_num = re.search(r'\b(one|two|three|four|five|1|2|3|4|5)\b', user_input_lower)
+
+                if last_listed_history and selection_match_by_num:
+                    logging.info("MAIN_HISTORY_TOOL: User is selecting from a previous list by number.")
+                    num_map = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5}
                     try:
-                        clip_to_play = random.choice(interrupt_audio_files)
-                        data_int, sr_int = sf.read(str(clip_to_play), dtype='float32')
-                        sd.play(data_int, sr_int); sd.wait()
-                    except Exception as e: print(f"‼️ Could not play interrupt clip: {e}", file=sys.stderr)
+                        selected_indices = [num_map.get(n, int(n)) - 1 for n in re.findall(r'\b(one|two|three|four|five|1|2|3|4|5)\b', user_input_lower)]
+                        selected_searches = [last_listed_history[i] for i in selected_indices if 0 <= i < len(last_listed_history)]
 
-                interruption_requested.clear()
-                print("MAIN: Interruption processed.")
+                        if not selected_searches:
+                            context = "The user referred to a number, but it wasn't a valid selection from the history I provided. Gently let them know and ask them to choose from the numbers listed."
+                        else:
+                            context = "The user has asked for more details on the following past searches. Please provide a helpful summary based on the information provided:\n\n"
+                            for search in selected_searches:
+                                context += f"--- Logged Search Data ---\n"
+                                context += f"Original Question they asked: '{search.get('original_question', 'N/A')}'\n"
+                                context += f"The query you executed was: '{search.get('executed_query', 'N/A')}'\n"
+                                context += f"The summary you gave them last time was: '{search.get('summary_answer', 'N/A')}'\n\n"
+                            context += "Based on this, please provide a fresh, helpful summary or answer any follow-up questions they might have."
 
-                is_stop_command = any(keyword in current_user_input.lower().strip(".?!, ") for keyword in INTERRUPT_KEYWORDS)
-                if is_stop_command:
-                    print("INFO: Stop command received. Awaiting next input.")
-                    current_generation_id = None
+                        messages_for_llm = [{"role": "system", "content": personas['default']}, {"role": "user", "content": context}]
+                        tool_was_used = True
+                        chat_history.append({"role": "user", "content": current_user_input})
+                    except (ValueError, IndexError):
+                        messages_for_llm = [{"role": "system", "content": personas['default']}, {"role": "user", "content": "Tell the user you didn't understand which number they referred to."}]
+                    last_listed_history.clear()
+
+                elif last_listed_history and not selection_match_by_num:
+                    logging.info("MAIN_HISTORY_TOOL: User may be selecting from a previous list by title.")
+                    best_match = None
+                    highest_ratio = 0.4
+                    for i, search in enumerate(last_listed_history):
+                        ratio = SequenceMatcher(None, user_input_lower, search.get('executed_query', '').lower()).ratio()
+                        if ratio > highest_ratio:
+                            highest_ratio = ratio
+                            best_match = search
+
+                    if best_match:
+                        context = "The user has asked for more details on the following past search. Please provide a helpful summary based on the information provided:\n\n"
+                        context += f"--- Logged Search Data ---\n"
+                        context += f"Original Question they asked: '{best_match.get('original_question', 'N/A')}'\n"
+                        context += f"The query you executed was: '{best_match.get('executed_query', 'N/A')}'\n"
+                        context += f"The summary you gave them last time was: '{best_match.get('summary_answer', 'N/A')}'\n\n"
+                        context += "Based on this, please provide a fresh, helpful summary or answer any follow-up questions they might have."
+
+                        messages_for_llm = [{"role": "system", "content": personas['default']}, {"role": "user", "content": context}]
+                        tool_was_used = True
+                        chat_history.append({"role": "user", "content": current_user_input})
+                        last_listed_history.clear()
+                    else:
+                        last_listed_history.clear()
+                        system_prompt = personas['default'] + (f"\n\n--- SUMMARY ---\n{current_memories}" if current_memories else "")
+                        messages_for_llm = [{"role": "system", "content": system_prompt}] + chat_history[1:] + [{"role": "user", "content": current_user_input}]
+                        chat_history.append({"role": "user", "content": current_user_input})
+
+                elif any(keyword in user_input_lower for keyword in HISTORY_KEYWORDS):
+                    logging.info("MAIN_HISTORY_TOOL: User is requesting the history list.")
+                    recent_searches = search_logger.read_recent_searches(count=5)
+                    last_listed_history.clear()
+                    last_listed_history.extend(recent_searches)
+                    if not last_listed_history:
+                        response_text = "It looks like you don't have any searches in your history yet."
+                    else:
+                        response_text = "Okay, here are your most recent searches.."
+                        for i, search in enumerate(last_listed_history):
+                            query = search.get('executed_query', 'an unknown topic')
+                            response_text += f" Number {i+1}: {query}.."
+                    current_generation_id = uuid.uuid4()
+                    prefetch_q.put((current_generation_id, [(response_text, 0)]))
+                    print(f"🤖 Assistant: {response_text}")
+                    chat_history.append({"role": "user", "content": current_user_input})
+                    chat_history.append({"role": "assistant", "content": response_text})
+                    continue
+
+                elif web_tools.check_for_search_keyword(current_user_input):
+                    last_listed_history.clear()
+                    proposed_query = web_tools.check_for_search_keyword(current_user_input)
+                    pending_search["query"] = proposed_query
+                    pending_search["original_input"] = current_user_input
+                    confirmation_question = f"I think you want me to search for: \"{proposed_query}\". Is that correct?"
+                    current_generation_id = uuid.uuid4()
+                    prefetch_q.put((current_generation_id, [(confirmation_question, 0)]))
+                    print(f"🤖 Assistant: {confirmation_question}")
+                    logging.info(f"MAIN_AWAIT_CONFIRM: Waiting for user confirmation for query: '{proposed_query}'")
                     continue
                 else:
-                    print("INFO: Barge-in with new prompt. Proceeding.")
+                    last_listed_history.clear()
+                    system_prompt = personas['default'] + (f"\n\n--- SUMMARY ---\n{current_memories}" if current_memories else "")
+                    messages_for_llm = [{"role": "system", "content": system_prompt}] + chat_history[1:] + [{"role": "user", "content": current_user_input}]
+                    chat_history.append({"role": "user", "content": current_user_input})
 
             current_generation_id = uuid.uuid4()
-
-            if not was_an_interruption and speech_duration > 0.1:
-                filler_clip_to_play = None
-                if speech_duration > INTERRUPTION_DURATION_THRESHOLD_S and long_query_audio_files:
-                    filler_clip_to_play = random.choice(long_query_audio_files)
-                elif pending_audio_files:
-                    filler_clip_to_play = random.choice(pending_audio_files)
-                if filler_clip_to_play:
-                    audio_q.put((current_generation_id, filler_clip_to_play, "[FILLER_AUDIO]"))
-
-            if current_user_input.lower() in {"quit","exit"}: program_is_shutting_down.set(); break
-            if current_user_input.lower() == "mem": print(f"\n--- MEMORY ---\n{current_memories or '[none]'}\n---"); continue
-            if current_user_input.lower() == "dump": [print(f"[{m['role']}] {m['content']}") for m in chat_history]; print("---"); continue
-
-            messages_for_llm = list(chat_history)
-            system_prompt = PERSONA_TEMPLATE
-            if current_memories:
-                system_prompt += f"\n\n--- CONVERSATION MEMORIES ---\n{current_memories}"
-            messages_for_llm[0] = {"role": "system", "content": system_prompt}
-            messages_for_llm.append({"role": "user", "content": current_user_input})
-
-            print(f"🤖 Assistant thinking... (Gen: {current_generation_id})", end='', flush=True, file=sys.stderr)
+            logging.info(f"MAIN_NEW_GEN_ID: {current_generation_id.hex[:8]}")
 
             llm_full_response = ""
             try:
-                chunker_instance = StreamingChunker(min_words=MIN_WORDS_FOR_CHUNK)
-
-                def token_tee(token_iterator):
-                    nonlocal llm_full_response
-                    for token in token_iterator:
-                        llm_full_response += token
-                        yield token
-                        print(token, end='', flush=True, file=sys.stderr)
-
-                token_stream = token_tee(hermes_chat(messages_for_llm))
-
-                for i, sanitized_chunk in enumerate(chunker_instance.chunker(token_stream)):
-                    if i == 0: print(file=sys.stderr) # Newline after "thinking..."
-                    if interruption_requested.is_set(): break
-
-                    prefetch_q.put((current_generation_id, [sanitized_chunk]))
-
-                if interruption_requested.is_set():
-                    if current_user_input: chat_history.append({"role": "user", "content": current_user_input})
-                    continue
-
+                chunker = StreamingChunker(min_words=config.MIN_WORDS_FOR_CHUNK)
+                token_stream = hermes_chat(messages_for_llm)
+                chunks_with_sequence = [(chunk, i) for i, chunk in enumerate(chunker.chunker(token_stream))]
+                if chunks_with_sequence:
+                    prefetch_q.put((current_generation_id, chunks_with_sequence))
+                    llm_full_response = " ".join(c[0] for c in chunks_with_sequence)
             except Exception as e:
-                print(f"\n‼️ Error during LLM streaming/chunking: {e}", file=sys.stderr); traceback.print_exc()
-                if current_user_input: chat_history.append({"role": "user", "content": current_user_input})
+                logging.error(f"MAIN_LLM_STREAM_ERROR: {e}", exc_info=True)
                 continue
 
-            assistant_response_for_chat_history = strip_action_and_emoji(llm_full_response)
-            if not assistant_response_for_chat_history.strip():
-                if current_user_input: chat_history.append({"role": "user", "content": current_user_input})
+            assistant_response = strip_action_and_emoji(llm_full_response).strip()
+            if not assistant_response:
                 continue
 
-            if current_user_input: chat_history.append({"role": "user", "content": current_user_input})
-            chat_history.append({"role": "assistant", "content": assistant_response_for_chat_history})
+            log_prefix = "ASSISTANT (from tool):" if tool_was_used else "ASSISTANT:"
+            logging.info(f"{log_prefix} '{assistant_response[:100]}...'")
+            print(f"🤖 Assistant: {assistant_response}")
 
-            total_tokens_in_history = sum(rough_tokens(m['content']) for m in chat_history)
-            if total_tokens_in_history > TOKEN_SOFT_LIMIT:
-                messages_to_retain = KEEP_RECENT * 2
-                if len(chat_history) > messages_to_retain + 1:
-                    messages_to_summarize = chat_history[1:-(messages_to_retain)]
-                    if messages_to_summarize:
-                        transcript_to_summarize = "\n".join(f"{m['role']}: {m['content']}" for m in messages_to_summarize)
-                        print(f"🧠 Pruning chat. Summarizing {len(messages_to_summarize)} messages.")
-                        memory_q.put((current_memories, transcript_to_summarize))
-                        chat_history = [chat_history[0]] + chat_history[-(messages_to_retain):]
+            chat_history.append({"role": "assistant", "content": assistant_response})
 
-            while sum(rough_tokens(m['content']) for m in chat_history) > TOKEN_HARD_LIMIT:
-                if len(chat_history) > 2:
-                    print(f"‼️ HARD TOKEN PRUNING: Removing '{chat_history[1]['content'][:30]}...'")
-                    del chat_history[1]
-                else: break
+            if tool_was_used:
+                if pending_search.get("query") and pending_search.get("original_input"):
+                    search_logger.log_search(
+                        original_question=pending_search["original_input"],
+                        executed_query=pending_search["query"],
+                        summary_answer=assistant_response
+                    )
+                pending_search["query"] = None
+                pending_search["original_input"] = None
 
-    except KeyboardInterrupt: print("\n🚨 Main loop interrupted by user.");
-    except Exception as e: print(f"‼️ UNHANDLED EXCEPTION IN MAIN: {e}"); traceback.print_exc()
+            total_tokens = sum(rough_tokens(m['content']) for m in chat_history)
+            if total_tokens > config.TOKEN_SOFT_LIMIT:
+                to_retain_count = config.KEEP_RECENT * 2
+                if len(chat_history) > to_retain_count + 1:
+                    to_summarize = chat_history[1:-to_retain_count]
+                    if to_summarize:
+                        transcript = "\n".join(f"{m['role']}: {m['content']}" for m in to_summarize)
+                        memory_q.put((current_memories, transcript))
+                        chat_history = [chat_history[0]] + chat_history[-to_retain_count:]
+            while sum(rough_tokens(m['content']) for m in chat_history) > config.TOKEN_HARD_LIMIT and len(chat_history) > 2:
+                del chat_history[1]
+
+            logging.info(f"MAIN_TURN_END: Duration: {(time.monotonic() - turn_start_time) * 1000:.0f}ms.")
+
+    except (KeyboardInterrupt, EOFError):
+        logging.info("\nMAIN_INTERRUPT: Shutting down...")
     finally:
-        print("🛑 Shutting down...")
-        if not program_is_shutting_down.is_set(): program_is_shutting_down.set()
-        audio_q.put((None, None, None)); prefetch_q.put((None, None)); memory_q.put((None,None))
-        active_threads = [t for t in threads if t.is_alive()]
-        for t in active_threads:
+        logging.info("MAIN_FINALIZING: Initiating shutdown...")
+        program_is_shutting_down.set()
+        audio_q.put((None, None, None, None))
+        prefetch_q.put((None, None))
+        memory_q.put((None, None))
+        for name, t in threads.items():
             t.join(timeout=2.0)
-            if t.is_alive(): print(f"⚠️ {t.name} did not join cleanly.")
-        print("🧹 Final cleanup..."); cleanup_old_audio(); print("👋 Goodbye!")
+            if t.is_alive(): logging.warning(f"MAIN_FINALIZING_THREAD_ALIVE: {name} did not shut down cleanly.")
+        cleanup_old_audio()
+        logging.info("MAIN_SHUTDOWN_COMPLETE: Application has shut down.")
+        print("\n👋 Goodbye!")
 
-if __name__=="__main__":
-    main()
+if __name__ == "__main__":
+    personas = {}
+    SUMMARY_PROMPT = ""
+    try:
+        main()
+    except FileNotFoundError as e:
+        logging.critical(f"MAIN_FATAL_PROMPT_MISSING: {e}. Please check paths in config.py.", exc_info=True)
+        sys.exit(1)
+    except Exception as e:
+        logging.critical(f"MAIN_FATAL_STARTUP_ERROR: {e}", exc_info=True)
+        sys.exit(1)

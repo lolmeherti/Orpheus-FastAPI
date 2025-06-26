@@ -24,7 +24,7 @@ MOOD_CLASSIFIER_BOT = ROOT_DIR / "personas/mood_classifier_bot.txt"
 PERSONA_PROMPT_TEMPLATE = ROOT_DIR / "personas/tts_default.txt"
 SCRAPE_SUMMARY_BOT_TEMPLATE = ROOT_DIR / "personas/scrape_summary_bot.txt"
 
-
+BROWSING_CACHE = ROOT_DIR / "browsing_cache"
 # ==============================================================================
 # == API & SERVICE CONFIGURATION ==
 # ==============================================================================

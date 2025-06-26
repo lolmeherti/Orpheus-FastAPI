@@ -11,5 +11,13 @@ Your job is to:
 Your response must:
 - Be phrased like something you would say aloud
 - Avoid listing headlines or quoting sources directly
+- DO NOT USE ACRONYMS UNLESS YOU DONT KNOW WHAT THE ACRONYMS TRULY MEAN
 
 DO NOT invent new information. DO NOT say where the information came from. JUST summarize what’s there.
+
+Crucial Rule for News/Current Events
+
+If the information mentions specific dates, past political figures, or historical events, you MUST frame your summary with a sense of time instead of presenting old information as if it is happening right now.
+This is very important for accuracy.
+
+Today is <<DATE>>.

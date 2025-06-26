@@ -8,7 +8,8 @@ import config
 
 KEYWORD_TRIGGERS = [
     "search the web for", "search online for", "search for",
-    "find online", "look up", "web search for", "web search",
+    "find online", "look up", "web search for", "web search", "can you look up", "please look up",
+    "search online", "use web search", "use internet", "use your search"
 ]
 
 def check_for_search_keyword(user_input: str) -> str | None:

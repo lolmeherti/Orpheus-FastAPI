@@ -36,7 +36,7 @@ current_generation_id = None
 pending_search = {"query": None, "original_input": None}
 CONFIRMATION_KEYWORDS = {"yes", "yep", "yeah", "that's right", "correct", "indeed", "go ahead", "do it", "sure"}
 
-HISTORY_KEYWORDS = {"what was my last search", "show my search history", "what were my recent searches", "list my searches", "list my search history", "what is my search history"}
+HISTORY_KEYWORDS = {"what was my last search", "show my search history", "what were my recent searches", "list my searches", "list my search history", "list search history", "what is my search history"}
 
 last_listed_history = []
 
@@ -380,7 +380,7 @@ def main():
                     proposed_query = web_tools.check_for_search_keyword(current_user_input)
                     pending_search["query"] = proposed_query
                     pending_search["original_input"] = current_user_input
-                    confirmation_question = f"I think you want me to search for: \"{proposed_query}\". Is that correct?"
+                    confirmation_question = f"I think you want me to search for {proposed_query}. Is that correct?"
                     current_generation_id = uuid.uuid4()
                     prefetch_q.put((current_generation_id, [(confirmation_question, 0)]))
                     print(f"🤖 Assistant: {confirmation_question}")
